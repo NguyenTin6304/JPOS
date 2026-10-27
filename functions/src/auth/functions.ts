@@ -18,6 +18,7 @@ import {
   joyworldPassSecret,
   joyworldUserSecret,
 } from "../services/joyworldCatalogService";
+import { shadowBackendKeySecret } from "../services/shadowBackend";
 import {
   checkoutPosOrderForUser,
   getLatestPosOrderForUser,
@@ -101,8 +102,14 @@ export const resolvePosLoginIdentifier = onCall(
   },
 );
 
+// Order preparation and checkout also send shadow writes (services/shadowBackend.ts).
+const POS_SESSION_OPTIONS = {
+  ...CALLABLE_OPTIONS,
+  secrets: [...CALLABLE_OPTIONS.secrets, shadowBackendKeySecret],
+};
+
 export const getPosAuthSession = onCall(
-  CALLABLE_OPTIONS,
+  POS_SESSION_OPTIONS,
   async (request) => {
     const device = await assertActivePosDevice(request.data);
     if (!request.auth) {
