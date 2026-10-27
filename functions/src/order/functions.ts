@@ -37,6 +37,10 @@ import {
   voucherFieldsForOrder,
 } from "../services/voucherService";
 import { getCurrentVietnamDayRange } from "./orderHistoryRange";
+import {
+  buildShadowOrderCommand,
+  sendShadowOrder,
+} from "../services/shadowBackend";
 
 interface OrderItemInput {
   goodsId: string;
@@ -662,6 +666,12 @@ export async function preparePosOrderForUser(
       return draft;
     });
 
+    // Parallel-run shadow write; never throws (services/shadowBackend.ts).
+    await sendShadowOrder(
+      "prepare",
+      buildShadowOrderCommand("prepare", input, items, operator, order),
+    );
+
     return {
       localOrderId: order.localOrderId,
       status: order.status,
@@ -808,6 +818,14 @@ export async function checkoutPosOrderForUser(
 
     const paidSnapshot = await docRef.get();
     const paidOrder = paidSnapshot.data() as PosOrder;
+    if (shouldMarkPaid) {
+      // Cash checkout without vouchers just became LOCAL_PAID. Parallel-run
+      // shadow write; never throws (services/shadowBackend.ts).
+      await sendShadowOrder(
+        "checkout",
+        buildShadowOrderCommand("checkout", input, items, operator, paidOrder),
+      );
+    }
     return {
       localOrderId: paidOrder.localOrderId,
       hkOrderNumber: paidOrder.hkOrderNumber,
