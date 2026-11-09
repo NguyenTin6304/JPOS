@@ -40,6 +40,7 @@ import { getCurrentVietnamDayRange } from "./orderHistoryRange";
 import {
   buildShadowOrderCommand,
   sendShadowOrder,
+  sendShadowPayment,
 } from "../services/shadowBackend";
 
 interface OrderItemInput {
@@ -519,7 +520,7 @@ export async function stagePosOrderForPayOS(
     );
   }
 
-  return db.runTransaction(async (transaction) => {
+  const staged = await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(docRef);
     const now = new Date().toISOString();
     const voucherCalculation = input.voucherCodes.length > 0
@@ -621,6 +622,14 @@ export async function stagePosOrderForPayOS(
     });
     return stagedOrder;
   });
+
+  // Parallel-run shadow write; never throws (services/shadowBackend.ts).
+  await sendShadowPayment(
+    "qr-stage",
+    staged,
+    buildShadowOrderCommand("prepare", input, items, operator, staged),
+  );
+  return staged;
 }
 
 export async function preparePosOrderForUser(

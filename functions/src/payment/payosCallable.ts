@@ -7,6 +7,7 @@ import {
   payosChecksumKeySecret,
   payosClientIdSecret,
 } from "../services/payosService";
+import { shadowStoreTokensSecret } from "../services/shadowBackend";
 import {
   cancelPayOSPaymentForUser,
   confirmPayOSPaymentManuallyForUser,
@@ -29,10 +30,14 @@ export const payosPayment = onCall(
     cors: true,
     timeoutSeconds: 60,
     maxInstances: 20,
+    ...(process.env.GCLOUD_PROJECT === "test-jw-system"
+      ? { serviceAccount: "pos-payment-qa@test-jw-system.iam.gserviceaccount.com" }
+      : {}),
     secrets: [
       payosClientIdSecret,
       payosApiKeySecret,
       payosChecksumKeySecret,
+      shadowStoreTokensSecret,
     ],
   },
   async (request) => withPosRequestContext(async () => {

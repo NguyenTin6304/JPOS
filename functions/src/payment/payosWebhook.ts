@@ -13,6 +13,7 @@ import {
   payosChecksumKeySecret,
   payosClientIdSecret,
 } from "../services/payosService";
+import { shadowStoreTokensSecret } from "../services/shadowBackend";
 
 export const payosWebhook = onRequest(
   {
@@ -20,10 +21,14 @@ export const payosWebhook = onRequest(
     timeoutSeconds: 60,
     maxInstances: 20,
     cors: false,
+    ...(process.env.GCLOUD_PROJECT === "test-jw-system"
+      ? { serviceAccount: "pos-payment-qa@test-jw-system.iam.gserviceaccount.com" }
+      : {}),
     secrets: [
       payosClientIdSecret,
       payosApiKeySecret,
       payosChecksumKeySecret,
+      shadowStoreTokensSecret,
     ],
   },
   async (request, response) => {

@@ -6,6 +6,7 @@ const {
   SHADOW_TIMEOUT_MS,
   buildShadowOrderCommand,
   sendShadowOrder,
+  sendShadowPayment,
 } = require("../lib/services/shadowBackend");
 
 const TOKEN = "k".repeat(43);
@@ -175,6 +176,39 @@ test("backend errors, rejections and network failures never throw", async () => 
       assert.equal(warnings.length, 1);
     });
   }
+});
+
+test("a QR payment command goes to the payment path and cannot overwrite the order reference", async () => {
+  await withFakes({ respond: ok() }, async ({ calls }) => {
+    await sendShadowPayment(
+      "payos-status",
+      { localOrderId: input.localOrderId, warehouseId: "w1" },
+      { operation: "other", warehouseId: "w2", orderCode: 1 },
+    );
+
+    const { target, init } = calls[0];
+    assert.equal(target, "https://api.example.test/shadow/pos-orders/payment");
+    assert.equal(init.headers["X-Store-Token"], TOKEN);
+    assert.deepEqual(JSON.parse(init.body), {
+      operation: "payos-status",
+      warehouseId: "w1",
+      localOrderId: input.localOrderId,
+      orderCode: 1,
+    });
+  });
+});
+
+test("a failed QR payment command never throws and logs no order data", async () => {
+  await withFakes({ respond: async () => { throw new TypeError("fetch failed"); } }, async ({ warnings }) => {
+    await sendShadowPayment(
+      "payos-link",
+      { localOrderId: input.localOrderId, warehouseId: "w1" },
+      { link: { accountName: "CONG TY GIA" } },
+    );
+
+    assert.deepEqual(warnings[0][1], { operation: "payos-link", localOrderId: input.localOrderId, error: "TypeError" });
+    assert.equal(JSON.stringify(warnings).includes("CONG TY GIA"), false);
+  });
 });
 
 test("logs carry only the operation, order id and an error code, never order data", async () => {
