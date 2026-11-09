@@ -9,19 +9,24 @@ import type { OrderItem, OrderMemberSnapshot, PosOrder } from "../types/order";
 // the JJL Data Sync backend. The backend recomputes the order on its own and
 // compares it with Firestore. Firestore stays the source of truth.
 //
-// - Does nothing unless SHADOW_BACKEND_URL (Functions environment variable)
-//   and the SHADOW_BACKEND_KEY secret are both set.
+// - Does nothing unless SHADOW_BACKEND_URL (Functions environment variable) is
+//   set.
+// - Each store has its own token, sent in the X-Store-Token header. The
+//   SHADOW_STORE_TOKENS secret is a JSON object: { "<warehouseId>": "<token>" }.
+//   The backend takes the store from the token and refuses orders of other
+//   stores. Adding a store means a new secret version and a redeploy.
 // - Waits at most SHADOW_TIMEOUT_MS and swallows every error: a slow or broken
 //   backend must never fail or noticeably slow down a sale.
-// - Logs only the order id, the operation and an error name or status code.
+// - Logs only the order id, the store id, the operation and an error name or
+//   status code.
 //
-// Deploying a function that binds SHADOW_BACKEND_KEY fails when the secret is
+// Deploying a function that binds SHADOW_STORE_TOKENS fails when the secret is
 // missing from the project, so create it first on every project this code is
 // deployed to:
-//   firebase functions:secrets:set SHADOW_BACKEND_KEY --project test-jw-system
+//   firebase functions:secrets:set SHADOW_STORE_TOKENS --project test-jw-system
 // =============================================================================
 
-export const shadowBackendKeySecret = defineSecret("SHADOW_BACKEND_KEY");
+export const shadowStoreTokensSecret = defineSecret("SHADOW_STORE_TOKENS");
 export const SHADOW_TIMEOUT_MS = 2_000;
 
 export type ShadowOperation = "prepare" | "checkout";
@@ -88,6 +93,15 @@ export function buildShadowOrderCommand(
     : { ...command, paymentMethodId: order.paymentMethodId, paidAt: order.paidAt };
 }
 
+/** The store's token from the secret, or undefined when the store has none. */
+function storeToken(warehouseId: string): string | undefined {
+  const tokens: unknown = JSON.parse(shadowStoreTokensSecret.value() || "{}");
+  const token = tokens && typeof tokens === "object"
+    ? (tokens as Record<string, unknown>)[warehouseId]
+    : undefined;
+  return typeof token === "string" && token ? token : undefined;
+}
+
 /** Send one command to the backend. Never throws. */
 export async function sendShadowOrder(
   operation: ShadowOperation,
@@ -96,13 +110,21 @@ export async function sendShadowOrder(
   const baseUrl = process.env.SHADOW_BACKEND_URL?.trim().replace(/\/+$/, "");
   if (!baseUrl) return;
   const localOrderId = String(command.localOrderId ?? "");
+  const warehouseId = String(command.warehouseId ?? "");
 
   try {
-    const key = shadowBackendKeySecret.value();
-    if (!key) return;
+    const token = storeToken(warehouseId);
+    if (!token) {
+      logger.warn("[shadowBackend] Cửa hàng chưa có token ghi song song", {
+        operation,
+        localOrderId,
+        warehouseId,
+      });
+      return;
+    }
     const response = await fetch(`${baseUrl}/shadow/pos-orders/${operation}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Shadow-Key": key },
+      headers: { "Content-Type": "application/json", "X-Store-Token": token },
       body: JSON.stringify(command),
       signal: AbortSignal.timeout(SHADOW_TIMEOUT_MS),
     });

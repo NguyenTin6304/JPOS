@@ -8,7 +8,8 @@ const {
   sendShadowOrder,
 } = require("../lib/services/shadowBackend");
 
-const KEY = "k".repeat(43);
+const TOKEN = "k".repeat(43);
+const TOKENS = JSON.stringify({ w1: TOKEN, w2: "o".repeat(43) });
 const input = {
   localOrderId: "ORD-1761534000000-ABC123",
   shopId: 7,
@@ -31,14 +32,14 @@ const order = {
 
 /**
  * Run `body` with a fake fetch, env and logger; restore everything afterwards.
- * `url` or `key` set to null means the variable is not set at all.
+ * `url` or `tokens` set to null means the variable is not set at all.
  */
-async function withFakes({ url = "https://api.example.test/", key = KEY, respond }, body) {
+async function withFakes({ url = "https://api.example.test/", tokens = TOKENS, respond }, body) {
   const saved = {
     fetch: global.fetch,
     warn: logger.warn,
     url: process.env.SHADOW_BACKEND_URL,
-    key: process.env.SHADOW_BACKEND_KEY,
+    tokens: process.env.SHADOW_STORE_TOKENS,
   };
   const calls = [];
   const warnings = [];
@@ -49,8 +50,8 @@ async function withFakes({ url = "https://api.example.test/", key = KEY, respond
   logger.warn = (...args) => warnings.push(args);
   if (url === null) delete process.env.SHADOW_BACKEND_URL;
   else process.env.SHADOW_BACKEND_URL = url;
-  if (key === null) delete process.env.SHADOW_BACKEND_KEY;
-  else process.env.SHADOW_BACKEND_KEY = key;
+  if (tokens === null) delete process.env.SHADOW_STORE_TOKENS;
+  else process.env.SHADOW_STORE_TOKENS = tokens;
   try {
     await body({ calls, warnings });
   } finally {
@@ -58,8 +59,8 @@ async function withFakes({ url = "https://api.example.test/", key = KEY, respond
     logger.warn = saved.warn;
     if (saved.url === undefined) delete process.env.SHADOW_BACKEND_URL;
     else process.env.SHADOW_BACKEND_URL = saved.url;
-    if (saved.key === undefined) delete process.env.SHADOW_BACKEND_KEY;
-    else process.env.SHADOW_BACKEND_KEY = saved.key;
+    if (saved.tokens === undefined) delete process.env.SHADOW_STORE_TOKENS;
+    else process.env.SHADOW_STORE_TOKENS = saved.tokens;
   }
 }
 
@@ -94,16 +95,25 @@ test("checkout command sends the payment method and paidAt instead of updatedAt"
   assert.equal("uid" in command || "member" in command, false);
 });
 
-test("nothing is sent until the backend URL and key are configured", async () => {
-  for (const settings of [{ url: null }, { url: "  " }, { key: null }]) {
+test("nothing is sent until the backend URL and the store token are configured", async () => {
+  const settingsList = [
+    { url: null },
+    { url: "  " },
+    { tokens: null },
+    { tokens: JSON.stringify({ other: TOKEN }) },
+    { tokens: "not json" },
+    { tokens: "[]" },
+    { tokens: JSON.stringify({ w1: 7 }) },
+  ];
+  for (const settings of settingsList) {
     await withFakes({ ...settings, respond: ok() }, async ({ calls }) => {
-      await sendShadowOrder("prepare", { localOrderId: input.localOrderId });
+      await sendShadowOrder("prepare", { localOrderId: input.localOrderId, warehouseId: "w1" });
       assert.equal(calls.length, 0);
     });
   }
 });
 
-test("the command is posted with the internal key and a short timeout", async () => {
+test("the command is posted with the token of its store and a short timeout", async () => {
   await withFakes({ respond: ok() }, async ({ calls, warnings }) => {
     const command = buildShadowOrderCommand("checkout", input, items, operator, order);
 
@@ -113,11 +123,41 @@ test("the command is posted with the internal key and a short timeout", async ()
     const { target, init } = calls[0];
     assert.equal(target, "https://api.example.test/shadow/pos-orders/checkout");
     assert.equal(init.method, "POST");
-    assert.equal(init.headers["X-Shadow-Key"], KEY);
+    assert.equal(init.headers["X-Store-Token"], TOKEN);
     assert.deepEqual(JSON.parse(init.body), JSON.parse(JSON.stringify(command)));
     assert.ok(init.signal instanceof AbortSignal);
     assert.equal(SHADOW_TIMEOUT_MS, 2000);
     assert.equal(warnings.length, 0);
+  });
+});
+
+test("each store sends its own token", async () => {
+  await withFakes({ respond: ok() }, async ({ calls }) => {
+    const command = buildShadowOrderCommand("prepare", { ...input, warehouseId: "w2" }, items, operator, order);
+
+    await sendShadowOrder("prepare", command);
+
+    assert.equal(calls[0].init.headers["X-Store-Token"], "o".repeat(43));
+  });
+});
+
+test("a store without a token is reported, and no token appears in the log", async () => {
+  await withFakes({ tokens: JSON.stringify({ w2: TOKEN }), respond: ok() }, async ({ calls, warnings }) => {
+    await sendShadowOrder("prepare", buildShadowOrderCommand("prepare", input, items, operator, order));
+
+    assert.equal(calls.length, 0);
+    assert.deepEqual(warnings[0][1], { operation: "prepare", localOrderId: input.localOrderId, warehouseId: "w1" });
+    assert.equal(JSON.stringify(warnings).includes(TOKEN), false);
+  });
+});
+
+test("a broken secret never throws and its content is not logged", async () => {
+  await withFakes({ tokens: `not json ${TOKEN}`, respond: ok() }, async ({ calls, warnings }) => {
+    await sendShadowOrder("prepare", buildShadowOrderCommand("prepare", input, items, operator, order));
+
+    assert.equal(calls.length, 0);
+    assert.deepEqual(warnings[0][1], { operation: "prepare", localOrderId: input.localOrderId, error: "SyntaxError" });
+    assert.equal(JSON.stringify(warnings).includes(TOKEN), false);
   });
 });
 
@@ -144,6 +184,6 @@ test("logs carry only the operation, order id and an error code, never order dat
     const [, details] = warnings[0];
     assert.deepEqual(details, { operation: "prepare", localOrderId: input.localOrderId, error: "TypeError" });
     assert.equal(JSON.stringify(warnings).includes(operator.name), false);
-    assert.equal(JSON.stringify(warnings).includes(KEY), false);
+    assert.equal(JSON.stringify(warnings).includes(TOKEN), false);
   });
 });
