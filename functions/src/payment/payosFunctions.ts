@@ -12,6 +12,7 @@ import * as logger from "firebase-functions/logger";
 import { db } from "../config/firebase";
 import { POS_COLLECTIONS } from "../config/collections";
 import { stagePosOrderForPayOS } from "../order/functions";
+import { runShadowedTransaction } from "../services/shadowTransaction";
 import { buildPayOSRedirectUrls, getPayOS } from "../services/payosService";
 import { getPosAuthSession } from "../services/posAuthService";
 import {
@@ -211,7 +212,7 @@ async function recordPayOSConnectionError(
 ): Promise<void> {
   const errorMessage = error instanceof Error ? error.message : String(error);
   try {
-    await db.runTransaction(async (transaction) => {
+    await runShadowedTransaction("payos-connection-error", async (transaction, recordShadow) => {
       const snapshot = await transaction.get(docRef);
       if (!snapshot.exists) return;
       const order = snapshot.data() as PosOrder;
@@ -226,6 +227,7 @@ async function recordPayOSConnectionError(
         },
         updatedAt: now,
       });
+      recordShadow(order, { checkedAt: now });
     });
   } catch (recordError: unknown) {
     logger.error("[PayOS] Không thể lưu lỗi kết nối để kiểm toán", {
@@ -247,7 +249,7 @@ async function reservePaymentAttempt(
   userId: string,
 ): Promise<{ order: PosOrder; attempt: PayOSPaymentAttempt }> {
   const session = await getPosAuthSession(userId);
-  return db.runTransaction(async (transaction) => {
+  return runShadowedTransaction("payos-reserve", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     if (!snapshot.exists) {
       throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
@@ -339,6 +341,12 @@ async function reservePaymentAttempt(
       updatedAt: nextOrder.updatedAt,
     });
     writePaymentStatus(transaction, nextOrder);
+    recordShadow(nextOrder, {
+      operatorUid: userId,
+      warehouseCode: warehouse.code,
+      orderCode,
+      reservedAt: attempt.createdAt,
+    });
     return { order: nextOrder, attempt };
   });
 }
@@ -369,7 +377,7 @@ async function storeCreatedPaymentLink(
       })),
     });
 
-    const storedOrder = await db.runTransaction(async (transaction) => {
+    const storedOrder = await runShadowedTransaction("payos-link", async (transaction, recordShadow) => {
       const freshSnapshot = await transaction.get(docRef);
       if (!freshSnapshot.exists) {
         throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
@@ -428,6 +436,25 @@ async function storeCreatedPaymentLink(
       };
       transaction.update(docRef, { paymentDetails, updatedAt: now });
       writePaymentStatus(transaction, nextOrder);
+      recordShadow(nextOrder, {
+        orderCode: reservedAttempt.orderCode,
+        link: {
+          status: paymentLink.status,
+          amount: paymentLink.amount,
+          description: paymentLink.description,
+          paymentLinkId: paymentLink.paymentLinkId,
+          checkoutUrl: paymentLink.checkoutUrl,
+          qrCode: paymentLink.qrCode,
+          bin: paymentLink.bin,
+          accountNumber: paymentLink.accountNumber,
+          accountName: paymentLink.accountName,
+          currency: paymentLink.currency,
+          expiredAt: paymentLink.expiredAt,
+        },
+        storedAt: now,
+        displayExpiresAt: createdAttempt.displayExpiresAt,
+        createRequestStartedAt,
+      });
       return nextOrder;
     });
     const storedAttempt = getCurrentAttempt(storedOrder);
@@ -464,7 +491,7 @@ async function markAttemptFailed(
   orderCode: number,
   errorMessage: string,
 ): Promise<void> {
-  await db.runTransaction(async (transaction) => {
+  await runShadowedTransaction("payos-failed", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     if (!snapshot.exists) return;
     const order = snapshot.data() as PosOrder;
@@ -488,6 +515,7 @@ async function markAttemptFailed(
       updatedAt: now,
     });
     writePaymentStatus(transaction, { ...order, paymentDetails, updatedAt: now });
+    recordShadow(order, { orderCode, error: errorMessage, failedAt: now });
   });
 }
 
@@ -498,7 +526,7 @@ async function updateAttemptStatus(
   allowCompletedOrder = false,
   remoteCancellationConfirmed?: boolean,
 ): Promise<PosOrder> {
-  return db.runTransaction(async (transaction) => {
+  return runShadowedTransaction("payos-status", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     if (!snapshot.exists) {
       throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
@@ -541,6 +569,13 @@ async function updateAttemptStatus(
     const nextOrder: PosOrder = { ...order, paymentDetails, updatedAt: now };
     transaction.update(docRef, { paymentDetails, updatedAt: now });
     writePaymentStatus(transaction, nextOrder);
+    recordShadow(nextOrder, {
+      orderCode,
+      status,
+      allowCompletedOrder,
+      ...(remoteCancellationConfirmed === undefined ? {} : { remoteCancellationConfirmed }),
+      updatedAt: now,
+    });
     return nextOrder;
   });
 }
@@ -550,7 +585,7 @@ export async function markPayOSPaymentPaid(
   orderCode: number,
   payment: VerifiedPayment,
 ): Promise<"PAID" | "ALREADY_COMPLETED" | "REJECTED"> {
-  return db.runTransaction(async (transaction) => {
+  return runShadowedTransaction("payos-paid", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     if (!snapshot.exists) return "REJECTED";
     const order = snapshot.data() as PosOrder;
@@ -640,6 +675,7 @@ export async function markPayOSPaymentPaid(
       if (attempt.status !== "PAID" || (isPayOSOrder(order) && order.paymentVerificationStatus === "UNVERIFIED")) {
         transaction.update(docRef, { paymentDetails, ...verificationUpdate, updatedAt: paidAt });
         writePaymentStatus(transaction, { ...order, paymentDetails, ...verificationUpdate, updatedAt: paidAt });
+        recordShadow(order, { orderCode, payment, paidAt });
       }
       return "ALREADY_COMPLETED";
     }
@@ -654,6 +690,7 @@ export async function markPayOSPaymentPaid(
       updatedAt: paidAt,
     });
     writePaymentStatus(transaction, { ...order, status: "LOCAL_PAID", paymentDetails, ...verificationUpdate, paidAt, updatedAt: paidAt });
+    recordShadow(order, { orderCode, payment, paidAt });
     return "PAID";
   });
 }
@@ -873,7 +910,7 @@ export async function reconcileCompletedPayOSOrder(docRef: DocumentReference, ma
       errors.push(error instanceof Error ? error.message : "Không thể kiểm tra PayOS.");
     }
   }
-  return db.runTransaction(async (transaction) => {
+  return runShadowedTransaction("payos-reconcile-retry", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     const current = snapshot.data() as PosOrder;
     if (!needsPayOSReconciliation(current)) return current;
@@ -890,6 +927,7 @@ export async function reconcileCompletedPayOSOrder(docRef: DocumentReference, ma
     const next = { ...current, payosReconciliation, updatedAt: now };
     transaction.update(docRef, { payosReconciliation, updatedAt: now });
     writePaymentStatus(transaction, next);
+    recordShadow(next, { checkedAt: now, nextCheckAt: payosReconciliation.nextCheckAt, errors });
     return next;
   });
 }
@@ -974,7 +1012,7 @@ export async function confirmPayOSPaymentManuallyForUser(
     );
     return buildPaymentResult(confirmedOrder);
   }
-  const confirmedOrder = await db.runTransaction(async (transaction) => {
+  const confirmedOrder = await runShadowedTransaction("payos-manual-confirm", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(authorized.docRef);
     if (!snapshot.exists) {
       throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
@@ -1059,6 +1097,11 @@ export async function confirmPayOSPaymentManuallyForUser(
       updatedAt: confirmedAt,
     });
     writePaymentStatus(transaction, nextOrder);
+    recordShadow(nextOrder, {
+      operatorUid: userId,
+      operatorName: authorized.operatorName,
+      confirmedAt,
+    });
     return nextOrder;
   });
   return buildPaymentResult(confirmedOrder);
@@ -1088,7 +1131,7 @@ export async function resumePayOSPaymentForUser(
   const displayExpiresAt = new Date(
     Date.now() + PAYOS_DISPLAY_WINDOW_MS,
   ).toISOString();
-  const nextOrder = await db.runTransaction(async (transaction) => {
+  const nextOrder = await runShadowedTransaction("payos-resume", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(authorized.docRef);
     if (!snapshot.exists) {
       throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
@@ -1105,6 +1148,7 @@ export async function resumePayOSPaymentForUser(
     const updatedAt = new Date().toISOString();
     transaction.update(authorized.docRef, { paymentDetails, updatedAt });
     writePaymentStatus(transaction, { ...order, paymentDetails, updatedAt });
+    recordShadow(order, { orderCode: current.orderCode, displayExpiresAt, updatedAt });
     return { ...order, paymentDetails, updatedAt } as PosOrder;
   });
   return buildPaymentResult(nextOrder);
@@ -1140,7 +1184,7 @@ async function cancelAttemptLocallyAfterPayOSFailure(
   error: unknown,
 ): Promise<PosOrder> {
   const errorMessage = error instanceof Error ? error.message : String(error);
-  const cancelledOrder = await db.runTransaction(async (transaction) => {
+  const cancelledOrder = await runShadowedTransaction("payos-local-cancel", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     if (!snapshot.exists) {
       throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
@@ -1181,6 +1225,7 @@ async function cancelAttemptLocallyAfterPayOSFailure(
     };
     transaction.update(docRef, { paymentDetails, updatedAt: now });
     writePaymentStatus(transaction, nextOrder);
+    recordShadow(nextOrder, { orderCode: attempt.orderCode, cancelledAt: now });
     return nextOrder;
   });
 

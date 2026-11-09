@@ -3,6 +3,7 @@ import { HttpsError } from "firebase-functions/v2/https";
 import { db } from "../config/firebase";
 import { POS_COLLECTIONS } from "../config/collections";
 import { getPosAuthSession } from "../services/posAuthService";
+import { runShadowedTransaction } from "../services/shadowTransaction";
 import { writePaymentStatus } from "./paymentStatusProjection";
 import {
   applyOrderVouchers,
@@ -228,7 +229,7 @@ export async function activateFixedTransferForOrder(
     description,
   });
 
-  return db.runTransaction(async (transaction) => {
+  return runShadowedTransaction("fixed-activate", async (transaction, recordShadow) => {
     const freshSnapshot = await transaction.get(docRef);
     if (!freshSnapshot.exists) {
       throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
@@ -261,6 +262,16 @@ export async function activateFixedTransferForOrder(
       updatedAt: now,
     });
     writePaymentStatus(transaction, { ...freshOrder, fixedTransferDetails, updatedAt: now });
+    recordShadow(freshOrder, {
+      operatorUid: userId,
+      warehouseCode: warehouse.code,
+      reason,
+      bankBin: settings.bankBin,
+      accountNumber: settings.accountNumber,
+      accountName: settings.accountName,
+      settingsVersion: settings.version,
+      activatedAt: now,
+    });
     return { ...freshOrder, fixedTransferDetails, updatedAt: now };
   });
 }
@@ -270,7 +281,7 @@ export async function confirmFixedTransferForOrder(
   docRef: DocumentReference,
   operatorName: string,
 ): Promise<PosOrder> {
-  return db.runTransaction(async (transaction) => {
+  return runShadowedTransaction("fixed-confirm", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     if (!snapshot.exists) {
       throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
@@ -333,6 +344,7 @@ export async function confirmFixedTransferForOrder(
       updatedAt: confirmedAt,
     });
     writePaymentStatus(transaction, nextOrder);
+    recordShadow(nextOrder, { operatorUid: userId, operatorName, confirmedAt });
     return nextOrder;
   });
 }
@@ -341,7 +353,7 @@ export async function cancelFixedTransferForOrder(
   userId: string,
   docRef: DocumentReference,
 ): Promise<PosOrder> {
-  return db.runTransaction(async (transaction) => {
+  return runShadowedTransaction("fixed-cancel", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     if (!snapshot.exists) {
       throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
@@ -367,6 +379,7 @@ export async function cancelFixedTransferForOrder(
     );
     transaction.update(docRef, { fixedTransferDetails, updatedAt });
     writePaymentStatus(transaction, { ...order, fixedTransferDetails, updatedAt });
+    recordShadow(order, { operatorUid: userId, updatedAt });
     return { ...order, fixedTransferDetails, updatedAt };
   });
 }

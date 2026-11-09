@@ -5,6 +5,8 @@ import * as logger from "firebase-functions/logger";
 import { db } from "../config/firebase";
 import { POS_COLLECTIONS } from "../config/collections";
 import { getPosAuthSession } from "../services/posAuthService";
+import { sendShadowPayment, shadowStoreTokensSecret } from "../services/shadowBackend";
+import { runShadowedTransaction } from "../services/shadowTransaction";
 import type { ActivePosDevice } from "../services/posDeviceAccessService";
 import { payosApiKeySecret, payosChecksumKeySecret, payosClientIdSecret } from "../services/payosService";
 import type { PosOrder } from "../types/order";
@@ -50,12 +52,14 @@ function summary(order: PosOrder, userId: string) {
 
 /** Initialize legacy manually completed orders without querying PayOS on every list. */
 async function initialize(ref: DocumentReference): Promise<PosOrder> {
-  return db.runTransaction(async (transaction) => {
+  return runShadowedTransaction("payos-reconcile-init", async (transaction, recordShadow) => {
     const order = (await transaction.get(ref)).data() as PosOrder;
     if (!needsPayOSReconciliation(order) || order.payosReconciliation) return order;
-    const dueAt = payOSReconciliationDueAt(order) ?? new Date().toISOString();
+    const now = new Date().toISOString();
+    const dueAt = payOSReconciliationDueAt(order) ?? now;
     const payosReconciliation = { dueAt, nextCheckAt: dueAt };
     transaction.update(ref, { payosReconciliation });
+    recordShadow(order, { at: now });
     return { ...order, payosReconciliation };
   });
 }
@@ -99,10 +103,11 @@ export async function handlePayOSReconciliation(
       };
     }
     await initialize(ref);
-    await db.runTransaction(async (transaction) => {
+    await runShadowedTransaction("payos-reconcile-ack", async (transaction, recordShadow) => {
       const order = (await transaction.get(ref)).data() as PosOrder;
       if (!needsPayOSReconciliation(order)) return;
       transaction.update(ref, { "payosReconciliation.acknowledgedBy": FieldValue.arrayUnion(userId) });
+      recordShadow(order, { operatorUid: userId, at: new Date().toISOString() });
     });
     return { acknowledged: true };
   }
@@ -146,7 +151,10 @@ export async function handlePayOSReconciliation(
 
 export const reconcilePendingPayOSPayments = onSchedule({
   schedule: "every 1 minutes", region: "asia-southeast1", timeoutSeconds: 120, maxInstances: 1,
-  secrets: [payosClientIdSecret, payosApiKeySecret, payosChecksumKeySecret],
+  ...(process.env.GCLOUD_PROJECT === "test-jw-system"
+    ? { serviceAccount: "pos-payment-qa@test-jw-system.iam.gserviceaccount.com" }
+    : {}),
+  secrets: [payosClientIdSecret, payosApiKeySecret, payosChecksumKeySecret, shadowStoreTokensSecret],
 }, async () => {
   const snapshot = await db.collection(POS_COLLECTIONS.orders)
     .where("payosReconciliation.nextCheckAt", "<=", new Date().toISOString())
@@ -158,6 +166,7 @@ export const reconcilePendingPayOSPayments = onSchedule({
           await reconcileCompletedPayOSOrder(doc.ref);
         } else {
           await doc.ref.update({ "payosReconciliation.nextCheckAt": null });
+          await sendShadowPayment("payos-reconcile-clear", doc.data() as PosOrder, { at: new Date().toISOString() });
         }
       } catch (error) {
         logger.error("[PayOS reconciliation] Kiểm tra nền thất bại", { orderId: doc.id, error });

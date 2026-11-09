@@ -31,6 +31,29 @@ export const SHADOW_TIMEOUT_MS = 2_000;
 
 export type ShadowOperation = "prepare" | "checkout";
 
+/** One write of the QR payment flow, posted to /shadow/pos-orders/payment. */
+export type ShadowPaymentOperation =
+  | "qr-stage"
+  | "payos-reserve"
+  | "payos-link"
+  | "payos-failed"
+  | "payos-status"
+  | "payos-paid"
+  | "payos-connection-error"
+  | "payos-manual-confirm"
+  | "payos-resume"
+  | "payos-local-cancel"
+  | "payos-reconcile-retry"
+  | "payos-reconcile-init"
+  | "payos-reconcile-ack"
+  | "payos-reconcile-clear"
+  | "payment-watch"
+  | "fixed-activate"
+  | "fixed-confirm"
+  | "fixed-cancel";
+
+export type ShadowOrderRef = Pick<PosOrder, "localOrderId" | "warehouseId">;
+
 /** The validated order input, as produced by validateOrderInput. */
 export interface ShadowOrderInput {
   localOrderId: string;
@@ -102,9 +125,35 @@ function storeToken(warehouseId: string): string | undefined {
   return typeof token === "string" && token ? token : undefined;
 }
 
-/** Send one command to the backend. Never throws. */
+/** Send one prepare or checkout command to the backend. Never throws. */
 export async function sendShadowOrder(
   operation: ShadowOperation,
+  command: Record<string, unknown>,
+): Promise<void> {
+  await postCommand(operation, operation, command);
+}
+
+/**
+ * Send one write of the QR payment flow to the backend, after Firestore has
+ * committed it. `values` are the values this function generated or received from
+ * PayOS; the backend decides on its own what they change. Never throws.
+ */
+export async function sendShadowPayment(
+  operation: ShadowPaymentOperation,
+  order: ShadowOrderRef,
+  values: Record<string, unknown>,
+): Promise<void> {
+  await postCommand("payment", operation, {
+    ...values,
+    operation,
+    localOrderId: order.localOrderId,
+    warehouseId: order.warehouseId,
+  });
+}
+
+async function postCommand(
+  path: string,
+  operation: string,
   command: Record<string, unknown>,
 ): Promise<void> {
   const baseUrl = process.env.SHADOW_BACKEND_URL?.trim().replace(/\/+$/, "");
@@ -122,7 +171,7 @@ export async function sendShadowOrder(
       });
       return;
     }
-    const response = await fetch(`${baseUrl}/shadow/pos-orders/${operation}`, {
+    const response = await fetch(`${baseUrl}/shadow/pos-orders/${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Store-Token": token },
       body: JSON.stringify(command),

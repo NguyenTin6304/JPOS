@@ -4,6 +4,7 @@ import { HttpsError } from "firebase-functions/v2/https";
 import { db } from "../config/firebase";
 import { POS_COLLECTIONS } from "../config/collections";
 import { getPosAuthSession } from "../services/posAuthService";
+import { runShadowedTransaction } from "../services/shadowTransaction";
 import type { PosOrder } from "../types/order";
 
 export function paymentStatusSnapshot(order: PosOrder) {
@@ -56,7 +57,7 @@ export async function createPaymentWatch(
   }
   const expiresAt = Timestamp.fromMillis(Date.now() + 20 * 60 * 1000);
   const orderRef = db.collection(POS_COLLECTIONS.orders).doc(localOrderId);
-  const watchId = await db.runTransaction(async (transaction) => {
+  const watchId = await runShadowedTransaction("payment-watch", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(orderRef);
     if (!snapshot.exists) throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
     const order = snapshot.data() as PosOrder;
@@ -71,7 +72,15 @@ export async function createPaymentWatch(
       warehouseId: device.warehouseId,
       expiresAt,
     });
-    if (!order.paymentWatchId) transaction.update(orderRef, { paymentWatchId: id });
+    if (!order.paymentWatchId) {
+      transaction.update(orderRef, { paymentWatchId: id });
+      recordShadow(order, {
+        operatorUid: userId,
+        deviceId: device.id,
+        watchId: id,
+        at: new Date().toISOString(),
+      });
+    }
     return id;
   });
   return { watchId, expiresAt: expiresAt.toDate().toISOString() };
