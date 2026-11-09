@@ -103,9 +103,13 @@ export const resolvePosLoginIdentifier = onCall(
 );
 
 // Order preparation and checkout also send shadow writes (services/shadowBackend.ts).
+// test-jw-system has no JoyWorld secrets, so this function does not bind them there:
+// the JoyWorld paths report a missing configuration and call nothing.
 const POS_SESSION_OPTIONS = {
   ...CALLABLE_OPTIONS,
-  secrets: [...CALLABLE_OPTIONS.secrets, shadowBackendKeySecret],
+  secrets: process.env.GCLOUD_PROJECT === "test-jw-system"
+    ? [shadowBackendKeySecret]
+    : [...CALLABLE_OPTIONS.secrets, shadowBackendKeySecret],
 };
 
 export const getPosAuthSession = onCall(
