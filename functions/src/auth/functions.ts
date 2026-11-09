@@ -18,7 +18,7 @@ import {
   joyworldPassSecret,
   joyworldUserSecret,
 } from "../services/joyworldCatalogService";
-import { shadowBackendKeySecret } from "../services/shadowBackend";
+import { shadowStoreTokensSecret } from "../services/shadowBackend";
 import {
   checkoutPosOrderForUser,
   getLatestPosOrderForUser,
@@ -103,13 +103,20 @@ export const resolvePosLoginIdentifier = onCall(
 );
 
 // Order preparation and checkout also send shadow writes (services/shadowBackend.ts).
-// test-jw-system has no JoyWorld secrets, so this function does not bind them there:
-// the JoyWorld paths report a missing configuration and call nothing.
+// On test-jw-system:
+// - no JoyWorld secrets exist, so they are not bound: the JoyWorld paths report
+//   a missing configuration and call nothing;
+// - the default compute account can only read Firestore, so the function runs
+//   as the QA runtime account, like payosPayment there.
+const ON_TEST_PROJECT = process.env.GCLOUD_PROJECT === "test-jw-system";
 const POS_SESSION_OPTIONS = {
   ...CALLABLE_OPTIONS,
-  secrets: process.env.GCLOUD_PROJECT === "test-jw-system"
-    ? [shadowBackendKeySecret]
-    : [...CALLABLE_OPTIONS.secrets, shadowBackendKeySecret],
+  ...(ON_TEST_PROJECT
+    ? { serviceAccount: "pos-payment-qa@test-jw-system.iam.gserviceaccount.com" }
+    : {}),
+  secrets: ON_TEST_PROJECT
+    ? [shadowStoreTokensSecret]
+    : [...CALLABLE_OPTIONS.secrets, shadowStoreTokensSecret],
 };
 
 export const getPosAuthSession = onCall(
