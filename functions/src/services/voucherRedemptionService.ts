@@ -33,6 +33,17 @@ interface ApplyVoucherInput {
   reservedVouchers?: PosOrderVoucherSnapshot[];
 }
 
+/** The calculation applyOrderVouchers used, and the time it wrote on the voucher documents. */
+export interface AppliedVouchers extends VoucherCalculation {
+  appliedAt: Date;
+}
+
+/** The reservations releaseOrderVoucherReservations cancelled, and the time it wrote on them. */
+export interface ReleasedVouchers {
+  codes: string[];
+  releasedAt: Date;
+}
+
 interface VoucherRecord {
   code: string;
   codeRef: FirebaseFirestore.DocumentReference;
@@ -203,7 +214,7 @@ function redemptionDocument(input: {
 export async function applyOrderVouchers(
   transaction: FirebaseFirestore.Transaction,
   input: ApplyVoucherInput,
-): Promise<VoucherCalculation> {
+): Promise<AppliedVouchers> {
   const normalized = input.voucherCodes.map(normalizeVoucherCode);
   if (new Set(normalized).size !== normalized.length) {
     throw new HttpsError("invalid-argument", "Đơn hàng chứa voucher bị trùng.");
@@ -271,14 +282,15 @@ export async function applyOrderVouchers(
       notes: "Redeemed JPULSE voucher in JPOS",
     });
   }
-  return calculation;
+  // appliedAt is for the parallel-run shadow write (services/shadowBackend.ts).
+  return { ...calculation, appliedAt: now };
 }
 
 export async function releaseOrderVoucherReservations(
   transaction: FirebaseFirestore.Transaction,
   order: Pick<PosOrder, "localOrderId" | "voucherCodes" | "createdBy" | "deviceId" | "warehouseId">,
   reason: string,
-): Promise<void> {
+): Promise<ReleasedVouchers> {
   const snapshots = await Promise.all(
     (order.voucherCodes ?? []).map((code) =>
       transaction.get(
@@ -287,10 +299,12 @@ export async function releaseOrderVoucherReservations(
     ),
   );
   const now = new Date();
+  const codes: string[] = [];
   for (const snapshot of snapshots) {
     const redemption = snapshot.data() || {};
     if (!snapshot.exists || redemption.order_id !== order.localOrderId ||
         voucherText(redemption.status) !== "RESERVED") continue;
+    codes.push(snapshot.id);
     transaction.update(snapshot.ref, {
       status: "CANCELLED",
       cancelled_at: now,
@@ -317,6 +331,8 @@ export async function releaseOrderVoucherReservations(
       notes: reason,
     });
   }
+  // For the parallel-run shadow write (services/shadowBackend.ts).
+  return { codes, releasedAt: now };
 }
 
 export const voucherFieldsForOrder = (

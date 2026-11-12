@@ -7,6 +7,8 @@ const {
   buildShadowOrderCommand,
   sendShadowOrder,
   sendShadowPayment,
+  shadowAppliedVouchers,
+  shadowReleasedVouchers,
 } = require("../lib/services/shadowBackend");
 
 const TOKEN = "k".repeat(43);
@@ -94,6 +96,44 @@ test("checkout command sends the payment method and paidAt instead of updatedAt"
   assert.equal("updatedAt" in command, false);
   assert.equal("deviceId" in command, false);
   assert.equal("uid" in command || "member" in command, false);
+  assert.equal("vouchers" in command, false);
+});
+
+const applied = {
+  subtotalAmount: 180000,
+  discountAmount: 90000,
+  totalAmount: 90000,
+  vouchers: [{
+    code: "FREE-0001",
+    campaignId: "c1",
+    campaignName: "Tặng vé",
+    rewardType: "FREE_TICKET",
+    rewardValue: 0,
+    product: { goodsId: "g1", goodsName: "Vé", price: 90000, quantity: 1 },
+    discountAmount: 90000,
+  }],
+  appliedAt: new Date("2026-10-27T03:02:00.004Z"),
+};
+
+test("a checkout with vouchers sends the lookups without the discounts, and when they were written", () => {
+  const command = buildShadowOrderCommand(
+    "checkout", { ...input, voucherCodes: ["FREE-0001"] }, items, operator, order, applied,
+  );
+
+  const lookup = { ...applied.vouchers[0] };
+  delete lookup.discountAmount;
+  assert.deepEqual(command.vouchers, [lookup]);
+  assert.equal(command.vouchersAppliedAt, "2026-10-27T03:02:00.004Z");
+});
+
+test("writes that touch no voucher add nothing to the command", () => {
+  assert.deepEqual(shadowAppliedVouchers(null), {});
+  assert.deepEqual(shadowAppliedVouchers({ ...applied, vouchers: [] }), {});
+  assert.deepEqual(shadowReleasedVouchers({ codes: [], releasedAt: new Date() }), {});
+  assert.deepEqual(
+    shadowReleasedVouchers({ codes: ["FREE-0001"], releasedAt: new Date("2026-10-27T03:05:00.000Z") }),
+    { voucherRelease: { codes: ["FREE-0001"], releasedAt: "2026-10-27T03:05:00.000Z" } },
+  );
 });
 
 test("nothing is sent until the backend URL and the store token are configured", async () => {

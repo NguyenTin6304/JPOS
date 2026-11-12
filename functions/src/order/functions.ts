@@ -35,6 +35,7 @@ import { resolveLuckyDrawTicketCount } from "../luckyDraw/luckyDrawSettingsPolic
 import {
   applyOrderVouchers,
   voucherFieldsForOrder,
+  type AppliedVouchers,
 } from "../services/voucherService";
 import { getCurrentVietnamDayRange } from "./orderHistoryRange";
 import { canAccessCloseout, canReadOrder, canReadOrderRange, isOwnOrderToday } from "./reportAccessPolicy";
@@ -522,10 +523,12 @@ export async function stagePosOrderForPayOS(
     );
   }
 
+  // The vouchers the committed run reserved, for the parallel-run shadow write.
+  const shadow: { vouchers: AppliedVouchers | null } = { vouchers: null };
   const staged = await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(docRef);
     const now = new Date().toISOString();
-    const voucherCalculation = input.voucherCodes.length > 0
+    const appliedVouchers = input.voucherCodes.length > 0
       ? await applyOrderVouchers(transaction, {
           voucherCodes: input.voucherCodes,
           warehouseId: input.warehouseId,
@@ -536,12 +539,14 @@ export async function stagePosOrderForPayOS(
           items,
           mode: "RESERVE",
         })
-      : {
-          subtotalAmount,
-          discountAmount: 0,
-          totalAmount: subtotalAmount,
-          vouchers: [],
-        };
+      : null;
+    shadow.vouchers = appliedVouchers;
+    const voucherCalculation = appliedVouchers ?? {
+      subtotalAmount,
+      discountAmount: 0,
+      totalAmount: subtotalAmount,
+      vouchers: [],
+    };
     if (voucherCalculation.totalAmount <= 0) {
       throw new HttpsError(
         "failed-precondition",
@@ -629,7 +634,7 @@ export async function stagePosOrderForPayOS(
   await sendShadowPayment(
     "qr-stage",
     staged,
-    buildShadowOrderCommand("prepare", input, items, operator, staged),
+    buildShadowOrderCommand("prepare", input, items, operator, staged, shadow.vouchers),
   );
   return staged;
 }
@@ -736,7 +741,14 @@ export async function checkoutPosOrderForUser(
   const docRef = db.collection(POS_COLLECTIONS.orders).doc(input.localOrderId);
 
   try {
+    // What the committed run wrote, for the parallel-run shadow write.
+    const shadow: { vouchers: AppliedVouchers | null; paidAtomically: boolean } = {
+      vouchers: null,
+      paidAtomically: false,
+    };
     const shouldMarkPaid = await db.runTransaction(async (transaction) => {
+      shadow.vouchers = null;
+      shadow.paidAtomically = false;
       const snapshot = await transaction.get(docRef);
       const now = new Date().toISOString();
       const existing = snapshot.exists ? snapshot.data() as PosOrder : null;
@@ -752,7 +764,7 @@ export async function checkoutPosOrderForUser(
         if (existing.status !== "DRAFT") return false;
       }
 
-      const voucherCalculation = input.voucherCodes.length > 0
+      const appliedVouchers = input.voucherCodes.length > 0
         ? await applyOrderVouchers(transaction, {
             voucherCodes: input.voucherCodes,
             warehouseId: input.warehouseId,
@@ -764,12 +776,13 @@ export async function checkoutPosOrderForUser(
             mode: "COMMIT",
             reservedVouchers: existing?.vouchers,
           })
-        : {
-            subtotalAmount,
-            discountAmount: 0,
-            totalAmount: subtotalAmount,
-            vouchers: [],
-          };
+        : null;
+      const voucherCalculation = appliedVouchers ?? {
+        subtotalAmount,
+        discountAmount: 0,
+        totalAmount: subtotalAmount,
+        vouchers: [],
+      };
       const voucherFields = voucherFieldsForOrder(voucherCalculation);
       const completesAtomically = input.voucherCodes.length > 0;
       const completionFields = completesAtomically
@@ -780,6 +793,8 @@ export async function checkoutPosOrderForUser(
             paidAt: now,
           }
         : {};
+      shadow.vouchers = appliedVouchers;
+      shadow.paidAtomically = completesAtomically;
 
       if (!existing) {
         transaction.create(docRef, {
@@ -829,12 +844,13 @@ export async function checkoutPosOrderForUser(
 
     const paidSnapshot = await docRef.get();
     const paidOrder = paidSnapshot.data() as PosOrder;
-    if (shouldMarkPaid) {
-      // Cash checkout without vouchers just became LOCAL_PAID. Parallel-run
-      // shadow write; never throws (services/shadowBackend.ts).
+    if (shouldMarkPaid || shadow.paidAtomically) {
+      // The order just became LOCAL_PAID: in the second update without vouchers,
+      // in the transaction itself with vouchers. Parallel-run shadow write; never
+      // throws (services/shadowBackend.ts).
       await sendShadowOrder(
         "checkout",
-        buildShadowOrderCommand("checkout", input, items, operator, paidOrder),
+        buildShadowOrderCommand("checkout", input, items, operator, paidOrder, shadow.vouchers),
       );
     }
     return {

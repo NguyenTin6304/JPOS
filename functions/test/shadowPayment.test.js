@@ -1,8 +1,9 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
-// Runs the real QR payment code on an in-memory Firestore and a fake PayOS, and
-// records every shadow command together with the order as Firestore holds it at
-// that moment. With SHADOW_FIXTURE_OUT set, the recording is written to a file:
-// the JJL Data Sync backend replays it and must rebuild the order at every step.
+// Runs the real QR payment and voucher code on an in-memory Firestore and a fake
+// PayOS, and records every shadow command together with the order and the
+// voucher redemptions as Firestore holds them at that moment. With
+// SHADOW_FIXTURE_OUT set, the recording is written to a file: the JJL Data Sync
+// backend replays it and must rebuild the documents at every step.
 // All data here is made up. No network, no Firestore, no PayOS.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -90,6 +91,8 @@ function setPath(document, path, value) {
   }
   if (value && value.constructor.name === "ArrayUnionTransform") {
     target[last] = [...new Set([...(target[last] ?? []), ...value.elements])];
+  } else if (value && value.constructor.name === "NumericIncrementTransform") {
+    target[last] = (target[last] ?? 0) + value.operand;
   } else {
     target[last] = structuredClone(value);
   }
@@ -263,8 +266,63 @@ function reset() {
     ["jpos_products/combo", {
       goodsName: "Vé combo", price: 90000, afterTaxPrice: 100000, taxRate: 10, taxRateType: 1, category: 1, ticketsPerUnit: 1,
     }],
+    ["jpos_products/nước", { goodsName: "Nước giả", price: 15, afterTaxPrice: 15, taxRate: 8, taxRateType: 1, category: 0 }],
   ]);
+  saveVouchers();
 }
+
+// JPULSE marketing campaigns, their codes, and the store settings that map each
+// campaign to a product (pos_voucher_campaign_settings).
+const CAMPAIGNS = {
+  "c-free": { name: "Tặng vé giả", rewardValue: 0, productId: "vé" },
+  "c-item": { name: "Tặng combo giả", rewardValue: 0, productId: "combo" },
+  "c-pct10": { name: "Giảm 10% giả", rewardValue: 10, productId: "nước" },
+  "c-pct20": { name: "Giảm 20% giả", rewardValue: 20, productId: "combo" },
+};
+const VOUCHER_CODES = [
+  ["FREE-0001", "c-free", "FREE_TICKET", "AVAILABLE"],
+  ["FREE-0002", "c-free", "FREE_TICKET", "DISTRIBUTED"],
+  ["ITEM-0001", "c-item", "FREE_ITEM", "DISTRIBUTED"],
+  ["PCT10-0001", "c-pct10", "DISCOUNT_PERCENT", "AVAILABLE"],
+  ["PCT20-0001", "c-pct20", "DISCOUNT_PERCENT", "DISTRIBUTED"],
+];
+
+function saveVouchers() {
+  for (const [id, campaign] of Object.entries(CAMPAIGNS)) {
+    store.set(`marketing_voucher_campaigns/${id}`, {
+      name: campaign.name,
+      status: "ACTIVE",
+      valid_from: "2026-11-01",
+      valid_to: "2026-12-31",
+      reward_value: campaign.rewardValue,
+      is_deleted: false,
+      code_counts: { available: 10, distributed: 10, used: 0 },
+      revision: 1,
+    });
+    store.set(`pos_voucher_campaign_settings/${WAREHOUSE}__${id}`, {
+      enabled: true,
+      is_deleted: false,
+      product_id: campaign.productId,
+      quantity: 1,
+    });
+  }
+  for (const [code, campaignId, rewardType, status] of VOUCHER_CODES) {
+    store.set(`marketing_voucher_codes/${code}`, {
+      campaign_id: campaignId,
+      campaign_name: CAMPAIGNS[campaignId].name,
+      reward_type: rewardType,
+      // The percent codes carry no value of their own and take the campaign's.
+      ...(rewardType === "DISCOUNT_PERCENT" ? {} : { reward_value: 0 }),
+      status,
+      is_deleted: false,
+      revision: 1,
+    });
+  }
+}
+
+const redemptions = () => Object.fromEntries([...store]
+  .filter(([path]) => path.startsWith("pos_voucher_redemptions/"))
+  .map(([path, document]) => [path.split("/")[1], structuredClone(document)]));
 
 function saveFixedTransferSettings(overrides = {}) {
   store.set(`pos_payment_settings/${DEVICE}`, {
@@ -394,6 +452,7 @@ test.before(() => {
       path: new URL(url).pathname.split("/").pop(),
       command,
       documentAfter: structuredClone(store.get(`pos_orders/${command.localOrderId}`)),
+      redemptionsAfter: redemptions(),
     });
     unmirroredWrites = 0;
     return new Response(JSON.stringify({ result: "applied", reason: null }), { status: 200 });
@@ -608,6 +667,90 @@ scenario("a cancelled QR, then the customer pays cash", async () => {
   tick(MINUTE);
   await checkoutPosOrderForUser(USER, { ...input(), paymentMethodId: "CASH" });
 }, ["qr-stage", "payos-reserve", "payos-link", "payos-status", "checkout"]);
+
+// --- Vouchers (round 3). Prices: vé 222, combo 100000, nước 15. ---
+
+const cash = (overrides) => checkoutPosOrderForUser(USER, { ...input(overrides), paymentMethodId: "CASH" });
+
+scenario("cash: a free ticket voucher", async () => {
+  await cash({ items: [{ goodsId: "vé", quantity: 2 }], voucherCodes: ["free-0001"] });
+}, ["checkout"]);
+
+scenario("cash over a prepared draft: a free item and a percent rounded half up", async () => {
+  // 10% of 45 is 4.5: JavaScript rounds it to 5.
+  const order = { items: [{ goodsId: "nước", quantity: 3 }, { goodsId: "combo", quantity: 1 }], voucherCodes: ["ITEM-0001", "PCT10-0001"] };
+  await preparePosOrderForUser(USER, input(order));
+  tick(MINUTE);
+  await cash(order);
+}, ["prepare", "checkout"]);
+
+scenario("cash: two free tickets cover the whole order", async () => {
+  await cash({ items: [{ goodsId: "vé", quantity: 2 }], voucherCodes: ["FREE-0001", "FREE-0002"] });
+}, ["checkout"]);
+
+scenario("QR with a percent voucher, paid by webhook", async () => {
+  await create({ items: [{ goodsId: "vé", quantity: 2 }, { goodsId: "combo", quantity: 1 }], voucherCodes: ["PCT20-0001"] });
+  tick(MINUTE);
+  await webhook(currentCode());
+}, ["qr-stage", "payos-reserve", "payos-link", "payos-paid"]);
+
+scenario("QR with a free ticket and a percent voucher, paid after a status check", async () => {
+  await create({
+    items: [{ goodsId: "vé", quantity: 2 }, { goodsId: "combo", quantity: 1 }],
+    voucherCodes: ["FREE-0002", "PCT20-0001"],
+  });
+  tick(MINUTE);
+  markPaidAtPayOS(currentCode());
+  await getPayOSPaymentStatusForUser(USER, reference());
+}, ["qr-stage", "payos-reserve", "payos-link", "payos-paid"]);
+
+scenario("QR with a voucher cancelled at the POS, then paid in cash", async () => {
+  const order = { items: [{ goodsId: "vé", quantity: 2 }], voucherCodes: ["FREE-0001"] };
+  await create(order);
+  tick(MINUTE);
+  await cancelPayOSPaymentForUser(USER, reference());
+  tick(MINUTE);
+  await cash(order);
+}, ["qr-stage", "payos-reserve", "payos-link", "payos-status", "checkout"]);
+
+scenario("QR with a voucher, PayOS unreachable: released at the POS", async () => {
+  await create({ items: [{ goodsId: "vé", quantity: 2 }], voucherCodes: ["FREE-0002"] });
+  tick(MINUTE);
+  payos.getError = unavailable();
+  await cancelPayOSPaymentForUser(USER, reference());
+}, ["qr-stage", "payos-reserve", "payos-link", "payos-local-cancel"]);
+
+scenario("QR with a voucher confirmed by hand", async () => {
+  await create({ items: [{ goodsId: "combo", quantity: 2 }], voucherCodes: ["ITEM-0001"] });
+  tick(MINUTE);
+  await confirmPayOSPaymentManuallyForUser(USER, reference());
+}, ["qr-stage", "payos-reserve", "payos-link", "payos-manual-confirm"]);
+
+scenario("QR with a voucher expires, the new QR is paid", async () => {
+  // The expiry releases the reservation, so the payment redeems the voucher afresh.
+  await create({ items: [{ goodsId: "vé", quantity: 3 }], voucherCodes: ["FREE-0001"] });
+  const first = currentCode();
+  tick(16 * MINUTE);
+  payos.links.get(first).status = "EXPIRED";
+  await recreatePayOSPaymentForUser(USER, reference());
+  tick(MINUTE);
+  await webhook(currentCode());
+}, ["qr-stage", "payos-reserve", "payos-link", "payos-status", "payos-reserve", "payos-link", "payos-paid"]);
+
+scenario("fixed account with a voucher, confirmed by hand", async () => {
+  saveFixedTransferSettings();
+  payos.createError = unavailable();
+  await create({ items: [{ goodsId: "vé", quantity: 2 }], voucherCodes: ["FREE-0001"] });
+  tick(MINUTE);
+  await confirmPayOSPaymentManuallyForUser(USER, reference());
+}, ["qr-stage", "payos-reserve", "payos-failed", "fixed-activate", "fixed-confirm"]);
+
+scenario("fixed account only, with a voucher, cancelled", async () => {
+  saveFixedTransferSettings({ fixedTransferOnly: true });
+  await create({ items: [{ goodsId: "vé", quantity: 2 }], voucherCodes: ["FREE-0001"] });
+  tick(MINUTE);
+  await cancelPayOSPaymentForUser(USER, reference());
+}, ["qr-stage", "fixed-activate", "fixed-cancel"]);
 
 test("a retried transaction sends only what the committed run recorded", async () => {
   reset();

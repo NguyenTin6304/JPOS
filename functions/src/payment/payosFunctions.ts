@@ -13,11 +13,13 @@ import { db } from "../config/firebase";
 import { POS_COLLECTIONS } from "../config/collections";
 import { stagePosOrderForPayOS } from "../order/functions";
 import { runShadowedTransaction } from "../services/shadowTransaction";
+import { shadowAppliedVouchers, shadowReleasedVouchers } from "../services/shadowBackend";
 import { buildPayOSRedirectUrls, getPayOS } from "../services/payosService";
 import { getPosAuthSession } from "../services/posAuthService";
 import {
   applyOrderVouchers,
   releaseOrderVoucherReservations,
+  type AppliedVouchers,
 } from "../services/voucherService";
 import type {
   PayOSPaymentAttempt,
@@ -559,13 +561,13 @@ async function updateAttemptStatus(
       lastCheckedAt: now,
       lastError: null,
     };
-    if (["CANCELLED", "EXPIRED"].includes(status)) {
-      await releaseOrderVoucherReservations(
-        transaction,
-        order,
-        "Released after PayOS payment cancellation or expiry",
-      );
-    }
+    const releasedVouchers = ["CANCELLED", "EXPIRED"].includes(status)
+      ? await releaseOrderVoucherReservations(
+          transaction,
+          order,
+          "Released after PayOS payment cancellation or expiry",
+        )
+      : null;
     const nextOrder: PosOrder = { ...order, paymentDetails, updatedAt: now };
     transaction.update(docRef, { paymentDetails, updatedAt: now });
     writePaymentStatus(transaction, nextOrder);
@@ -575,6 +577,7 @@ async function updateAttemptStatus(
       allowCompletedOrder,
       ...(remoteCancellationConfirmed === undefined ? {} : { remoteCancellationConfirmed }),
       updatedAt: now,
+      ...shadowReleasedVouchers(releasedVouchers),
     });
     return nextOrder;
   });
@@ -618,6 +621,7 @@ export async function markPayOSPaymentPaid(
       });
       return "REJECTED";
     }
+    let appliedVouchers: AppliedVouchers | null = null;
     if (decision !== "ALREADY_COMPLETED" && order.voucherCodes?.length) {
       const calculation = await applyOrderVouchers(transaction, {
         voucherCodes: order.voucherCodes,
@@ -630,6 +634,7 @@ export async function markPayOSPaymentPaid(
         mode: "COMMIT",
         reservedVouchers: order.vouchers,
       });
+      appliedVouchers = calculation;
       if (calculation.totalAmount !== order.totalAmount) {
         throw new HttpsError(
           "failed-precondition",
@@ -690,7 +695,7 @@ export async function markPayOSPaymentPaid(
       updatedAt: paidAt,
     });
     writePaymentStatus(transaction, { ...order, status: "LOCAL_PAID", paymentDetails, ...verificationUpdate, paidAt, updatedAt: paidAt });
-    recordShadow(order, { orderCode, payment, paidAt });
+    recordShadow(order, { orderCode, payment, paidAt, ...shadowAppliedVouchers(appliedVouchers) });
     return "PAID";
   });
 }
@@ -1037,6 +1042,7 @@ export async function confirmPayOSPaymentManuallyForUser(
         "Đơn hàng không ở trạng thái cho phép xác nhận chuyển khoản thủ công.",
       );
     }
+    let appliedVouchers: AppliedVouchers | null = null;
     if (order.voucherCodes?.length) {
       const calculation = await applyOrderVouchers(transaction, {
         voucherCodes: order.voucherCodes,
@@ -1049,6 +1055,7 @@ export async function confirmPayOSPaymentManuallyForUser(
         mode: "COMMIT",
         reservedVouchers: order.vouchers,
       });
+      appliedVouchers = calculation;
       if (calculation.totalAmount !== order.totalAmount) {
         throw new HttpsError(
           "failed-precondition",
@@ -1101,6 +1108,7 @@ export async function confirmPayOSPaymentManuallyForUser(
       operatorUid: userId,
       operatorName: authorized.operatorName,
       confirmedAt,
+      ...shadowAppliedVouchers(appliedVouchers),
     });
     return nextOrder;
   });
@@ -1213,7 +1221,7 @@ async function cancelAttemptLocallyAfterPayOSFailure(
       lastConnectionErrorAt: now,
       lastError: LOCAL_PAYOS_CANCELLATION_MESSAGE,
     };
-    await releaseOrderVoucherReservations(
+    const releasedVouchers = await releaseOrderVoucherReservations(
       transaction,
       order,
       "Released after local PayOS cancellation",
@@ -1225,7 +1233,11 @@ async function cancelAttemptLocallyAfterPayOSFailure(
     };
     transaction.update(docRef, { paymentDetails, updatedAt: now });
     writePaymentStatus(transaction, nextOrder);
-    recordShadow(nextOrder, { orderCode: attempt.orderCode, cancelledAt: now });
+    recordShadow(nextOrder, {
+      orderCode: attempt.orderCode,
+      cancelledAt: now,
+      ...shadowReleasedVouchers(releasedVouchers),
+    });
     return nextOrder;
   });
 

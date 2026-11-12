@@ -4,10 +4,12 @@ import { db } from "../config/firebase";
 import { POS_COLLECTIONS } from "../config/collections";
 import { getPosAuthSession } from "../services/posAuthService";
 import { runShadowedTransaction } from "../services/shadowTransaction";
+import { shadowAppliedVouchers, shadowReleasedVouchers } from "../services/shadowBackend";
 import { writePaymentStatus } from "./paymentStatusProjection";
 import {
   applyOrderVouchers,
   releaseOrderVoucherReservations,
+  type AppliedVouchers,
 } from "../services/voucherService";
 import type {
   FixedTransferDetails,
@@ -294,6 +296,7 @@ export async function confirmFixedTransferForOrder(
         "Đơn hàng chưa có mã QR tài khoản cố định đang chờ xác nhận.",
       );
     }
+    let appliedVouchers: AppliedVouchers | null = null;
     if (order.voucherCodes?.length) {
       const calculation = await applyOrderVouchers(transaction, {
         voucherCodes: order.voucherCodes,
@@ -306,6 +309,7 @@ export async function confirmFixedTransferForOrder(
         mode: "COMMIT",
         reservedVouchers: order.vouchers,
       });
+      appliedVouchers = calculation;
       if (calculation.totalAmount !== order.totalAmount) {
         throw new HttpsError(
           "failed-precondition",
@@ -344,7 +348,12 @@ export async function confirmFixedTransferForOrder(
       updatedAt: confirmedAt,
     });
     writePaymentStatus(transaction, nextOrder);
-    recordShadow(nextOrder, { operatorUid: userId, operatorName, confirmedAt });
+    recordShadow(nextOrder, {
+      operatorUid: userId,
+      operatorName,
+      confirmedAt,
+      ...shadowAppliedVouchers(appliedVouchers),
+    });
     return nextOrder;
   });
 }
@@ -372,14 +381,14 @@ export async function cancelFixedTransferForOrder(
       status: "CANCELLED",
       updatedAt,
     };
-    await releaseOrderVoucherReservations(
+    const releasedVouchers = await releaseOrderVoucherReservations(
       transaction,
       order,
       "Released after fixed-transfer cancellation",
     );
     transaction.update(docRef, { fixedTransferDetails, updatedAt });
     writePaymentStatus(transaction, { ...order, fixedTransferDetails, updatedAt });
-    recordShadow(order, { operatorUid: userId, updatedAt });
+    recordShadow(order, { operatorUid: userId, updatedAt, ...shadowReleasedVouchers(releasedVouchers) });
     return { ...order, fixedTransferDetails, updatedAt };
   });
 }

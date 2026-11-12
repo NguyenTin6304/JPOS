@@ -4,6 +4,7 @@ export {
   releaseOrderVoucherReservations,
   voucherFieldsForOrder,
 } from "./voucherRedemptionService";
+export type { AppliedVouchers, ReleasedVouchers } from "./voucherRedemptionService";
 export {
   normalizeVoucherCode,
   resolveVoucherForCart,

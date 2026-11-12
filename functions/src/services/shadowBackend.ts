@@ -1,6 +1,8 @@
 import * as logger from "firebase-functions/logger";
 import { defineSecret } from "firebase-functions/params";
 import type { OrderItem, OrderMemberSnapshot, PosOrder } from "../types/order";
+import type { PosOrderVoucherSnapshot } from "../types/voucher";
+import type { AppliedVouchers, ReleasedVouchers } from "./voucherRedemptionService";
 
 // =============================================================================
 // Shadow writes to the JJL Data Sync backend (parallel-run phase, test only)
@@ -82,9 +84,47 @@ type ShadowOrderValues = Pick<
 >;
 
 /**
+ * The voucher resolutions a write used (campaign, reward and product of each
+ * code, as looked up in Firestore), without the discounts: the backend computes
+ * those on its own.
+ */
+function voucherResolutions(vouchers: PosOrderVoucherSnapshot[]): Record<string, unknown>[] {
+  return vouchers.map((voucher) => ({
+    code: voucher.code,
+    campaignId: voucher.campaignId,
+    campaignName: voucher.campaignName,
+    rewardType: voucher.rewardType,
+    rewardValue: voucher.rewardValue,
+    product: voucher.product,
+  }));
+}
+
+/** Shadow values of a write that reserved or redeemed vouchers. */
+export function shadowAppliedVouchers(applied: AppliedVouchers | null): Record<string, unknown> {
+  return applied && applied.vouchers.length > 0
+    ? {
+        vouchers: voucherResolutions(applied.vouchers),
+        vouchersAppliedAt: applied.appliedAt.toISOString(),
+      }
+    : {};
+}
+
+/** Shadow values of a write that released voucher reservations. */
+export function shadowReleasedVouchers(released: ReleasedVouchers | null): Record<string, unknown> {
+  return released && released.codes.length > 0
+    ? {
+        voucherRelease: {
+          codes: released.codes,
+          releasedAt: released.releasedAt.toISOString(),
+        },
+      }
+    : {};
+}
+
+/**
  * Build the command the backend expects: the operation input (order fields,
- * authoritative priced items, operator) plus the values this function
- * generated itself, read from the order as written.
+ * authoritative priced items, operator, the vouchers the write applied) plus
+ * the values this function generated itself, read from the order as written.
  */
 export function buildShadowOrderCommand(
   operation: ShadowOperation,
@@ -92,6 +132,7 @@ export function buildShadowOrderCommand(
   items: OrderItem[],
   operator: ShadowOperator,
   order: ShadowOrderValues,
+  appliedVouchers: AppliedVouchers | null = null,
 ): Record<string, unknown> {
   const command = {
     localOrderId: input.localOrderId,
@@ -110,6 +151,7 @@ export function buildShadowOrderCommand(
     createdAt: order.createdAt,
     invoiceRequestToken: order.invoiceRequestToken,
     invoiceRequestCreatedAt: order.invoiceRequestCreatedAt,
+    ...shadowAppliedVouchers(appliedVouchers),
   };
   return operation === "prepare"
     ? { ...command, updatedAt: order.updatedAt }
