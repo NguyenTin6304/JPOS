@@ -1,6 +1,7 @@
 import { getFunctions } from "firebase-admin/functions";
 import * as logger from "firebase-functions/logger";
 import { defineSecret } from "firebase-functions/params";
+import { HttpsError } from "firebase-functions/v2/https";
 import type { OrderItem, OrderMemberSnapshot, PosOrder } from "../types/order";
 import type { PosOrderVoucherSnapshot } from "../types/voucher";
 import type { AppliedVouchers, ReleasedVouchers } from "./voucherRedemptionService";
@@ -273,9 +274,11 @@ async function postCommand(
 
 /**
  * Deliver one queued command (deliverShadowCommand, order/shadowDeliveryWorker.ts).
- * Throws when Cloud Tasks should send it again: the backend is unreachable,
- * overloaded or broken, or it deferred the command (HTTP 409) until the write
- * before it arrives. On the last try it logs the command as dropped instead:
+ * Throws HttpsError "unavailable" (HTTP 503) when Cloud Tasks should send it
+ * again: the backend is unreachable, overloaded or broken, or it deferred the
+ * command (HTTP 409) until the write before it arrives. An HttpsError only sets
+ * the response status; any other error would also be logged as an unhandled
+ * error on every try. On the last try it logs the command as dropped instead:
  * the backend's nightly heal copies the order from Firestore.
  */
 export async function handleShadowTask(task: ShadowTask, retryCount: number): Promise<void> {
@@ -293,7 +296,7 @@ export async function handleShadowTask(task: ShadowTask, retryCount: number): Pr
     });
     return;
   }
-  throw new Error(`Shadow command not delivered yet (${task.operation}, try ${attempts})`);
+  throw new HttpsError("unavailable", `Shadow command not delivered yet (${task.operation}, try ${attempts})`);
 }
 
 function isShadowTask(task: unknown): task is ShadowTask {

@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const logger = require("firebase-functions/logger");
 const adminFunctions = require("firebase-admin/functions");
+const { HttpsError } = require("firebase-functions/v2/https");
 const {
   SHADOW_QUEUE_MAX_ATTEMPTS,
   SHADOW_QUEUE_TIMEOUT_MS,
@@ -297,6 +298,12 @@ async function withQueue(enqueue, body) {
   }
 }
 
+/**
+ * Cloud Tasks retries on HTTP 503. An HttpsError sets that status without the
+ * "Unhandled error" log firebase-functions writes for any other error.
+ */
+const isRetry = (error) => error instanceof HttpsError && error.code === "unavailable";
+
 const queuedCheckout = (overrides = {}) => ({
   path: "checkout",
   operation: "checkout",
@@ -408,7 +415,7 @@ test("the worker asks Cloud Tasks to retry while the backend is down, busy or wa
   ];
   for (const respond of answers) {
     await withFakes({ respond }, async ({ warnings, errors }) => {
-      await assert.rejects(handleShadowTask(queuedCheckout(), 0));
+      await assert.rejects(handleShadowTask(queuedCheckout(), 0), isRetry);
 
       assert.equal(warnings.length, 1);
       assert.equal(errors.length, 0);
@@ -440,7 +447,7 @@ test("the worker drops a command that sending again cannot help", async () => {
 
 test("on the last try the worker logs the command as dropped instead of asking for a retry", async () => {
   await withFakes({ respond: async () => new Response("", { status: 503 }) }, async ({ errors }) => {
-    await assert.rejects(handleShadowTask(queuedCheckout(), SHADOW_QUEUE_MAX_ATTEMPTS - 2));
+    await assert.rejects(handleShadowTask(queuedCheckout(), SHADOW_QUEUE_MAX_ATTEMPTS - 2), isRetry);
     assert.equal(errors.length, 0);
 
     await handleShadowTask(queuedCheckout(), SHADOW_QUEUE_MAX_ATTEMPTS - 1);
