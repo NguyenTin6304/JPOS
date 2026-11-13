@@ -523,10 +523,15 @@ export async function stagePosOrderForPayOS(
     );
   }
 
-  // The vouchers the committed run reserved, for the parallel-run shadow write.
-  const shadow: { vouchers: AppliedVouchers | null } = { vouchers: null };
+  // The vouchers the committed run reserved, and the updatedAt it read, for the
+  // parallel-run shadow write.
+  const shadow: { vouchers: AppliedVouchers | null; previousUpdatedAt: string | null } = {
+    vouchers: null,
+    previousUpdatedAt: null,
+  };
   const staged = await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(docRef);
+    shadow.previousUpdatedAt = snapshot.exists ? (snapshot.data() as PosOrder).updatedAt ?? null : null;
     const now = new Date().toISOString();
     const appliedVouchers = input.voucherCodes.length > 0
       ? await applyOrderVouchers(transaction, {
@@ -635,6 +640,7 @@ export async function stagePosOrderForPayOS(
     "qr-stage",
     staged,
     buildShadowOrderCommand("prepare", input, items, operator, staged, shadow.vouchers),
+    shadow.previousUpdatedAt,
   );
   return staged;
 }
@@ -649,8 +655,11 @@ export async function preparePosOrderForUser(
   const docRef = db.collection(POS_COLLECTIONS.orders).doc(input.localOrderId);
 
   try {
+    // The updatedAt the committed run read, for the parallel-run shadow write.
+    const shadow: { previousUpdatedAt: string | null } = { previousUpdatedAt: null };
     const order = await db.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(docRef);
+      shadow.previousUpdatedAt = snapshot.exists ? (snapshot.data() as PosOrder).updatedAt ?? null : null;
       if (snapshot.exists) {
         const existing = snapshot.data() as PosOrder;
         if (existing.createdBy !== userId) {
@@ -685,7 +694,7 @@ export async function preparePosOrderForUser(
     // Parallel-run shadow write; never throws (services/shadowBackend.ts).
     await sendShadowOrder(
       "prepare",
-      buildShadowOrderCommand("prepare", input, items, operator, order),
+      buildShadowOrderCommand("prepare", input, items, operator, order, null, shadow.previousUpdatedAt),
     );
 
     return {
@@ -741,10 +750,18 @@ export async function checkoutPosOrderForUser(
   const docRef = db.collection(POS_COLLECTIONS.orders).doc(input.localOrderId);
 
   try {
-    // What the committed run wrote, for the parallel-run shadow write.
-    const shadow: { vouchers: AppliedVouchers | null; paidAtomically: boolean } = {
+    // What the committed run read and wrote, for the parallel-run shadow write.
+    // The shadow checkout command stands for both writes below (the transaction
+    // and the LOCAL_PAID update), so it is ordered after the order the
+    // transaction read.
+    const shadow: {
+      vouchers: AppliedVouchers | null;
+      paidAtomically: boolean;
+      previousUpdatedAt: string | null;
+    } = {
       vouchers: null,
       paidAtomically: false,
+      previousUpdatedAt: null,
     };
     const shouldMarkPaid = await db.runTransaction(async (transaction) => {
       shadow.vouchers = null;
@@ -752,6 +769,7 @@ export async function checkoutPosOrderForUser(
       const snapshot = await transaction.get(docRef);
       const now = new Date().toISOString();
       const existing = snapshot.exists ? snapshot.data() as PosOrder : null;
+      shadow.previousUpdatedAt = existing?.updatedAt ?? null;
 
       if (existing) {
         if (existing.createdBy !== userId) {
@@ -850,7 +868,9 @@ export async function checkoutPosOrderForUser(
       // throws (services/shadowBackend.ts).
       await sendShadowOrder(
         "checkout",
-        buildShadowOrderCommand("checkout", input, items, operator, paidOrder, shadow.vouchers),
+        buildShadowOrderCommand(
+          "checkout", input, items, operator, paidOrder, shadow.vouchers, shadow.previousUpdatedAt,
+        ),
       );
     }
     return {

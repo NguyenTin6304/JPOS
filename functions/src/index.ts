@@ -2,6 +2,7 @@ export { onMemberProfileChange, retryMemberProfileChanges } from "./member/profi
 export { onMemberImportCacheChanged } from "./member/memberImportJobs";
 export { onMemberRegistrationCreated, recoverMemberRegistration } from "./member/registrationRecoveryWorker";
 export { onMemberCardReturnJob, processMemberCardReturnJob } from "./member/cardReturnWorker";
+export { deliverShadowCommand } from "./order/shadowDeliveryWorker";
 export { onPartnerCardRecovery } from "./member/partnerCardRecoveryWorker";
 // =============================================================================
 // Firebase Cloud Functions — POS Sync Worker

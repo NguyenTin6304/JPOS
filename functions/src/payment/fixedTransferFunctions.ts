@@ -348,7 +348,7 @@ export async function confirmFixedTransferForOrder(
       updatedAt: confirmedAt,
     });
     writePaymentStatus(transaction, nextOrder);
-    recordShadow(nextOrder, {
+    recordShadow(order, {
       operatorUid: userId,
       operatorName,
       confirmedAt,

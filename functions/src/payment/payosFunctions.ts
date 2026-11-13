@@ -343,7 +343,7 @@ async function reservePaymentAttempt(
       updatedAt: nextOrder.updatedAt,
     });
     writePaymentStatus(transaction, nextOrder);
-    recordShadow(nextOrder, {
+    recordShadow(order, {
       operatorUid: userId,
       warehouseCode: warehouse.code,
       orderCode,
@@ -438,7 +438,7 @@ async function storeCreatedPaymentLink(
       };
       transaction.update(docRef, { paymentDetails, updatedAt: now });
       writePaymentStatus(transaction, nextOrder);
-      recordShadow(nextOrder, {
+      recordShadow(freshOrder, {
         orderCode: reservedAttempt.orderCode,
         link: {
           status: paymentLink.status,
@@ -571,7 +571,7 @@ async function updateAttemptStatus(
     const nextOrder: PosOrder = { ...order, paymentDetails, updatedAt: now };
     transaction.update(docRef, { paymentDetails, updatedAt: now });
     writePaymentStatus(transaction, nextOrder);
-    recordShadow(nextOrder, {
+    recordShadow(order, {
       orderCode,
       status,
       allowCompletedOrder,
@@ -932,7 +932,7 @@ export async function reconcileCompletedPayOSOrder(docRef: DocumentReference, ma
     const next = { ...current, payosReconciliation, updatedAt: now };
     transaction.update(docRef, { payosReconciliation, updatedAt: now });
     writePaymentStatus(transaction, next);
-    recordShadow(next, { checkedAt: now, nextCheckAt: payosReconciliation.nextCheckAt, errors });
+    recordShadow(current, { checkedAt: now, nextCheckAt: payosReconciliation.nextCheckAt, errors });
     return next;
   });
 }
@@ -1104,7 +1104,7 @@ export async function confirmPayOSPaymentManuallyForUser(
       updatedAt: confirmedAt,
     });
     writePaymentStatus(transaction, nextOrder);
-    recordShadow(nextOrder, {
+    recordShadow(order, {
       operatorUid: userId,
       operatorName: authorized.operatorName,
       confirmedAt,
@@ -1233,7 +1233,7 @@ async function cancelAttemptLocallyAfterPayOSFailure(
     };
     transaction.update(docRef, { paymentDetails, updatedAt: now });
     writePaymentStatus(transaction, nextOrder);
-    recordShadow(nextOrder, {
+    recordShadow(order, {
       orderCode: attempt.orderCode,
       cancelledAt: now,
       ...shadowReleasedVouchers(releasedVouchers),

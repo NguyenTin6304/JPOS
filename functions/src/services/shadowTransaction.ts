@@ -2,17 +2,22 @@ import type { Transaction } from "firebase-admin/firestore";
 import { db } from "../config/firebase";
 import {
   sendShadowPayment,
-  type ShadowOrderRef,
+  type ShadowOrderBefore,
   type ShadowPaymentOperation,
 } from "./shadowBackend";
 
+/**
+ * Record the shadow command of the order write. `before` is the order as this
+ * transaction read it, before writing: its updatedAt orders the command
+ * (previousUpdatedAt). Never pass the order as written.
+ */
 export type RecordShadow = (
-  order: ShadowOrderRef,
+  before: ShadowOrderBefore,
   values: Record<string, unknown>,
 ) => void;
 
 interface PendingShadow {
-  order: ShadowOrderRef;
+  before: ShadowOrderBefore;
   values: Record<string, unknown>;
 }
 
@@ -29,12 +34,13 @@ export async function runShadowedTransaction<T>(
   const result = await db.runTransaction((transaction) => {
     // Firestore may run the body again: only the run that committed counts.
     pending.write = null;
-    return body(transaction, (order, values) => {
-      pending.write = { order, values };
+    return body(transaction, (before, values) => {
+      pending.write = { before, values };
     });
   });
   if (pending.write) {
-    await sendShadowPayment(operation, pending.write.order, pending.write.values);
+    const { before, values } = pending.write;
+    await sendShadowPayment(operation, before, values, before.updatedAt ?? null);
   }
   return result;
 }

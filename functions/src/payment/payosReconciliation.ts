@@ -166,7 +166,10 @@ export const reconcilePendingPayOSPayments = onSchedule({
           await reconcileCompletedPayOSOrder(doc.ref);
         } else {
           await doc.ref.update({ "payosReconciliation.nextCheckAt": null });
-          await sendShadowPayment("payos-reconcile-clear", doc.data() as PosOrder, { at: new Date().toISOString() });
+          const order = doc.data() as PosOrder;
+          await sendShadowPayment(
+            "payos-reconcile-clear", order, { at: new Date().toISOString() }, order.updatedAt ?? null,
+          );
         }
       } catch (error) {
         logger.error("[PayOS reconciliation] Kiểm tra nền thất bại", { orderId: doc.id, error });
