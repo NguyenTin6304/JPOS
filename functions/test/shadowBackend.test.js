@@ -10,10 +10,14 @@ const {
   SHADOW_TIMEOUT_MS,
   buildShadowOrderCommand,
   handleShadowTask,
+  isShadowSyncOperation,
   sendShadowOrder,
   sendShadowPayment,
+  sendShadowSync,
   shadowAppliedVouchers,
   shadowReleasedVouchers,
+  shadowRemoteError,
+  shadowRemoteResponse,
 } = require("../lib/services/shadowBackend");
 
 const TOKEN = "k".repeat(43);
@@ -513,4 +517,84 @@ test("the queue worker retries for about 1.5 hours, one command at a time, under
     if (savedProject === undefined) delete process.env.GCLOUD_PROJECT;
     else process.env.GCLOUD_PROJECT = savedProject;
   }
+});
+
+// --- The 鲸舰 synchronization after payment, and the invoice request token (round 4) ---
+
+test("a sync command goes to the sync path, ordered by the order as the write read it", async () => {
+  await withFakes({ respond: ok() }, async ({ calls }) => {
+    await sendShadowSync(
+      "sync-claim",
+      { ...orderRef, updatedAt: BEFORE },
+      { operationId: "op-1", updatedAt: "2026-10-27T03:05:00.000Z", operation: "other", warehouseId: "w2" },
+    );
+    await sendShadowSync("invoice-token", orderRef, { invoiceRequestToken: "B".repeat(43) });
+
+    assert.equal(calls[0].target, "https://api.example.test/shadow/pos-orders/sync");
+    assert.equal(calls[0].init.headers["X-Store-Token"], TOKEN);
+    assert.deepEqual(JSON.parse(calls[0].init.body), {
+      operationId: "op-1",
+      updatedAt: "2026-10-27T03:05:00.000Z",
+      operation: "sync-claim",
+      localOrderId: input.localOrderId,
+      warehouseId: "w1",
+      previousUpdatedAt: BEFORE,
+    });
+    // An order read without updatedAt orders the command as created by the write before it.
+    assert.equal(JSON.parse(calls[1].init.body).previousUpdatedAt, null);
+  });
+  assert.equal(isShadowSyncOperation("sync-finish"), true);
+  assert.equal(isShadowSyncOperation("invoice-token"), true);
+  assert.equal(isShadowSyncOperation("payos-status"), false);
+});
+
+test("a 鲸舰 answer keeps only what the sync reads, and leaves out what the response did not have", () => {
+  assert.deepEqual(
+    shadowRemoteResponse("order_create", {
+      success: true, code: 0, msg: "", data: { orderNumber: "O-1", totalAmount: 222, actualPayment: 222 },
+    }),
+    { action: "order_create", success: true, code: 0, msg: "", orderNumber: "O-1" },
+  );
+  assert.deepEqual(
+    shadowRemoteResponse("order_pay_query", {
+      success: true, code: 0, msg: "ok", data: { orderNumber: "O-1", payStatus: "2", payStatusDesc: "paid" },
+    }),
+    { action: "order_pay_query", success: true, code: 0, msg: "ok", payStatus: "2" },
+  );
+  assert.deepEqual(
+    shadowRemoteResponse("order_pay", { success: false, code: 500, msg: "busy", data: { orderNumber: "O-1" } }),
+    { action: "order_pay", success: false, code: 500, msg: "busy" },
+  );
+  // The sync prints a missing field as "undefined" and null as "null": the two stay apart.
+  assert.deepEqual(shadowRemoteResponse("order_create", { success: true, data: null }), {
+    action: "order_create",
+    success: true,
+  });
+  assert.deepEqual(shadowRemoteResponse("order_create", { success: false, code: null, msg: null, data: "x" }), {
+    action: "order_create",
+    success: false,
+    code: null,
+    msg: null,
+  });
+});
+
+test("a 鲸舰 call that threw keeps the message the sync records as its error", () => {
+  assert.deepEqual(
+    shadowRemoteError("order_pay", new Error("HK API HTTP error: 502 Bad Gateway")),
+    { action: "order_pay", error: "HK API HTTP error: 502 Bad Gateway" },
+  );
+  assert.deepEqual(shadowRemoteError("order_pay_query", "boom"), { action: "order_pay_query", error: "boom" });
+});
+
+test("the worker delivers a queued sync command", async () => {
+  await withFakes({ respond: ok() }, async ({ calls }) => {
+    await handleShadowTask({
+      path: "sync",
+      operation: "sync-finish",
+      command: { operation: "sync-finish", localOrderId: input.localOrderId, warehouseId: "w1", remote: [] },
+    }, 0);
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].target, "https://api.example.test/shadow/pos-orders/sync");
+  });
 });

@@ -43,7 +43,12 @@ import {
   buildShadowOrderCommand,
   sendShadowOrder,
   sendShadowPayment,
+  shadowRemoteError,
+  shadowRemoteResponse,
+  type ShadowRemoteAction,
+  type ShadowRemoteCall,
 } from "../services/shadowBackend";
+import { runShadowedTransaction } from "../services/shadowTransaction";
 
 interface OrderItemInput {
   goodsId: string;
@@ -980,7 +985,7 @@ export async function getPosOrderForUser(
     return { order };
   }
 
-  const orderWithInvoiceToken = await db.runTransaction(async (transaction) => {
+  const orderWithInvoiceToken = await runShadowedTransaction("invoice-token", async (transaction, recordShadow) => {
     const latestSnapshot = await transaction.get(snapshot.ref);
     if (!latestSnapshot.exists) {
       throw new HttpsError("not-found", "Không tìm thấy đơn hàng.");
@@ -997,6 +1002,7 @@ export async function getPosOrderForUser(
       invoiceRequestToken,
       invoiceRequestCreatedAt,
     });
+    recordShadow(latestOrder, { invoiceRequestToken, invoiceRequestCreatedAt });
 
     return {
       ...latestOrder,
@@ -1288,7 +1294,7 @@ export async function retryPosOrderSyncForUser(
   }
 
   const updatedAt = new Date().toISOString();
-  const queued = await db.runTransaction(async (transaction) => {
+  const queued = await runShadowedTransaction("sync-retry", async (transaction, recordShadow) => {
     const currentSnapshot = await transaction.get(docRef);
     if (!currentSnapshot.exists) return false;
     const current = currentSnapshot.data() as PosOrder;
@@ -1303,6 +1309,7 @@ export async function retryPosOrderSyncForUser(
       "sync.retryCount": 0,
       "sync.lastError": null,
     });
+    recordShadow(current, { updatedAt });
     return true;
   });
   return {
@@ -1324,7 +1331,7 @@ async function synchronizeRemoteOrder(
   orderId: string,
 ): Promise<void> {
   const operationId = crypto.randomUUID();
-  const order = await db.runTransaction(async (transaction) => {
+  const order = await runShadowedTransaction("sync-claim", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     if (!snapshot.exists) return null;
     const current = snapshot.data() as PosOrder;
@@ -1347,14 +1354,33 @@ async function synchronizeRemoteOrder(
       version: claimed.version,
       updatedAt,
     });
+    recordShadow(current, { operationId, updatedAt });
     return claimed;
   });
   if (!order) return;
 
+  // What each 鲸舰 call of this run answered, in order: the shadow commands of
+  // the writes below carry it, and the backend replays the decisions on it.
+  const remoteCalls: ShadowRemoteCall[] = [];
+  const callRemote = async <TResponse extends { success?: unknown; code?: unknown; msg?: unknown; data?: unknown }>(
+    action: ShadowRemoteAction,
+    pending: Promise<TResponse>,
+  ): Promise<TResponse> => {
+    try {
+      const response = await pending;
+      remoteCalls.push(shadowRemoteResponse(action, response));
+      return response;
+    } catch (error: unknown) {
+      remoteCalls.push(shadowRemoteError(action, error));
+      throw error;
+    }
+  };
+
   const updateCurrentOperation = async (
-    values: FirebaseFirestore.UpdateData<FirebaseFirestore.DocumentData>,
+    operation: "sync-remote-order" | "sync-finish",
+    values: FirebaseFirestore.UpdateData<FirebaseFirestore.DocumentData> & { updatedAt: string },
   ): Promise<boolean> =>
-    db.runTransaction(async (transaction) => {
+    runShadowedTransaction(operation, async (transaction, recordShadow) => {
       const snapshot = await transaction.get(docRef);
       if (!snapshot.exists) return false;
       const current = snapshot.data() as PosOrder;
@@ -1363,19 +1389,20 @@ async function synchronizeRemoteOrder(
         ...values,
         version: (current.version ?? 0) + 1,
       });
+      recordShadow(current, { operationId, updatedAt: values.updatedAt, remote: [...remoteCalls] });
       return true;
     });
 
   let hkOrderNumber = order.hkOrderNumber;
   try {
     if (!hkOrderNumber) {
-      const createResponse = await createRemoteOrder({
+      const createResponse = await callRemote("order_create", createRemoteOrder({
         uid: order.uid || "",
         goodsItems: order.items.map((item) => ({
           goodsId: item.goodsId,
           quantity: String(item.quantity),
         })),
-      });
+      }));
       if (!createResponse.success) {
         throw new Error(
           `order_create thất bại: [${createResponse.code}] ${createResponse.msg}`,
@@ -1390,7 +1417,7 @@ async function synchronizeRemoteOrder(
         throw new Error("order_create không trả về orderNumber.");
       }
 
-      const retained = await updateCurrentOperation({
+      const retained = await updateCurrentOperation("sync-remote-order", {
         hkOrderNumber,
         remoteOrderId: order.remoteOrderId ?? null,
         updatedAt: new Date().toISOString(),
@@ -1399,17 +1426,17 @@ async function synchronizeRemoteOrder(
     }
 
     let statusResponse = order.hkOrderNumber
-      ? await queryPaymentStatus({ orderNumber: hkOrderNumber })
+      ? await callRemote("order_pay_query", queryPaymentStatus({ orderNumber: hkOrderNumber }))
       : null;
 
     if (!statusResponse || !isRemotePaymentConfirmed(statusResponse)) {
-      const payResponse = await confirmRemotePayment({
+      const payResponse = await callRemote("order_pay", confirmRemotePayment({
         orderNumber: hkOrderNumber,
         payAmount: order.voucherCodes?.length ? order.totalAmount : null,
-      });
-      statusResponse = await queryPaymentStatus({
+      }));
+      statusResponse = await callRemote("order_pay_query", queryPaymentStatus({
         orderNumber: hkOrderNumber,
-      });
+      }));
 
       if (
         !payResponse.success &&
@@ -1428,7 +1455,7 @@ async function synchronizeRemoteOrder(
     }
 
     const syncedAt = new Date().toISOString();
-    await updateCurrentOperation({
+    await updateCurrentOperation("sync-finish", {
       status: "SYNC_SUCCESS",
       paymentStatus: "PAID",
       syncStatus: "SYNC_SUCCESS",
@@ -1446,7 +1473,7 @@ async function synchronizeRemoteOrder(
     const errorMessage =
       error instanceof Error ? error.message : String(error);
     const updatedAt = new Date().toISOString();
-    await updateCurrentOperation({
+    await updateCurrentOperation("sync-finish", {
       status: "SYNC_FAILED",
       paymentStatus: order.paymentStatus ?? "PAID",
       syncStatus: "SYNC_FAILED",
@@ -1560,19 +1587,21 @@ export const retryFailedOrderSyncs = onSchedule(
 
     let queuedCount = 0;
     for (const document of snapshot.docs) {
-      const queued = await db.runTransaction(async (transaction) => {
+      const queued = await runShadowedTransaction("sync-requeue", async (transaction, recordShadow) => {
         const currentSnapshot = await transaction.get(document.ref);
         if (!currentSnapshot.exists) return false;
         const order = currentSnapshot.data() as PosOrder;
         if (!canQueueRemoteOrderRetry(order)) return false;
+        const updatedAt = new Date().toISOString();
         transaction.update(document.ref, {
           status: "LOCAL_PAID",
           paymentStatus: order.paymentStatus ?? "PAID",
           syncStatus: "PENDING",
           syncOperationId: null,
           version: (order.version ?? 0) + 1,
-          updatedAt: new Date().toISOString(),
+          updatedAt,
         });
+        recordShadow(order, { updatedAt });
         return true;
       });
       if (queued) queuedCount += 1;

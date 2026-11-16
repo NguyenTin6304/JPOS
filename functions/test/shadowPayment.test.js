@@ -27,7 +27,14 @@ const {
 } = require("../lib/payment/payosReconciliation");
 const { payosWebhook } = require("../lib/payment/payosWebhook");
 const { createPaymentWatch } = require("../lib/payment/paymentStatusProjection");
-const { checkoutPosOrderForUser, preparePosOrderForUser } = require("../lib/order/functions");
+const {
+  checkoutPosOrderForUser,
+  getPosOrderForUser,
+  onOrderLocalPaid,
+  preparePosOrderForUser,
+  retryFailedOrderSyncs,
+  retryPosOrderSyncForUser,
+} = require("../lib/order/functions");
 const { runShadowedTransaction } = require("../lib/services/shadowTransaction");
 
 const USER = "cashier-1";
@@ -69,6 +76,7 @@ let writeWithoutCommand;
 let allowTwoWritesPerCommand;
 let orderId;
 let payos;
+let hk;
 let scenarioCount = 0;
 const recordings = [];
 
@@ -139,6 +147,11 @@ class Ref {
 
   async update(value) {
     applyWrite({ ref: this, kind: "update", value });
+  }
+
+  async create(value) {
+    if (store.has(this.path)) throw Object.assign(new Error("Document already exists"), { code: 6 });
+    applyWrite({ ref: this, kind: "set", value });
   }
 }
 
@@ -261,6 +274,7 @@ function reset() {
   writeWithoutCommand = false;
   allowTwoWritesPerCommand = false;
   payos = { links: new Map() };
+  hk = { orders: new Map(), script: {}, calls: [], created: 0 };
   store = new Map([
     ["jpos_products/vé", { goodsName: "Vé test", price: 222, afterTaxPrice: 222, taxRate: 8, taxRateType: 1, category: 0 }],
     ["jpos_products/combo", {
@@ -416,6 +430,49 @@ function scenario(name, body, expectedOperations) {
   });
 }
 
+// A fake 鲸舰 (Jingjianx) in memory: hkApiService posts its signed requests to
+// HK_BASE_URL. By default an order is created, paid and then reported paid; a
+// scenario scripts other answers with hk.script[action] = [answer, ...].
+const HK_BASE_URL = "https://hk.example.test";
+
+function hkDefault(action, body) {
+  if (action === "order_create") {
+    hk.created += 1;
+    const orderNumber = `O-FAKE-${String(hk.created).padStart(4, "0")}`;
+    hk.orders.set(orderNumber, { paid: false });
+    return { json: { success: true, code: 0, msg: "", data: { orderNumber, totalAmount: 0, discountAmount: 0, actualPayment: 0 } } };
+  }
+  if (action === "order_pay") {
+    const remote = hk.orders.get(body.OrderNumber);
+    if (remote) remote.paid = true;
+    return { json: { success: Boolean(remote), code: remote ? 0 : 404, msg: remote ? "" : "order not found", data: { orderNumber: body.OrderNumber } } };
+  }
+  if (action === "order_pay_query") {
+    const paid = hk.orders.get(body.OrderNumber)?.paid === true;
+    return {
+      json: {
+        success: true,
+        code: 0,
+        msg: paid ? "" : "unpaid",
+        data: { orderNumber: body.OrderNumber, payStatus: paid ? 2 : 1, payStatusDesc: paid ? "paid" : "unpaid" },
+      },
+    };
+  }
+  throw new Error(`The fake 鲸舰 has no ${action}`);
+}
+
+async function hkFetch(init) {
+  const envelope = JSON.parse(init.body);
+  const body = JSON.parse(envelope.body);
+  hk.calls.push({ action: envelope.action, body });
+  const scripted = hk.script[envelope.action]?.shift();
+  const answer = scripted ? await scripted(body) : hkDefault(envelope.action, body);
+  return new Response(JSON.stringify(answer.json ?? {}), {
+    status: answer.status ?? 200,
+    statusText: answer.statusText ?? "",
+  });
+}
+
 const savedFetch = global.fetch;
 const savedSession = auth.getPosAuthSession;
 const savedGetPayOS = payosService.getPayOS;
@@ -445,7 +502,11 @@ test.before(() => {
     permissions: { global: { "*": true } },
   });
   payosService.getPayOS = fakePayOS;
+  process.env.HK_API_BASE_URL = HK_BASE_URL;
+  process.env.HK_API_APP_ID = "app-fake";
+  process.env.HK_API_KEY = "key-fake";
   global.fetch = async (url, init) => {
+    if (String(url).startsWith(HK_BASE_URL)) return hkFetch(init);
     const command = JSON.parse(init.body);
     assert.equal(init.headers["X-Store-Token"], "t".repeat(43));
     steps.push({
@@ -467,6 +528,9 @@ test.after(() => {
   Object.assign(db, savedDb);
   delete process.env.SHADOW_BACKEND_URL;
   delete process.env.SHADOW_STORE_TOKENS;
+  delete process.env.HK_API_BASE_URL;
+  delete process.env.HK_API_APP_ID;
+  delete process.env.HK_API_KEY;
   if (process.env.SHADOW_FIXTURE_OUT) {
     fs.writeFileSync(
       process.env.SHADOW_FIXTURE_OUT,
@@ -784,3 +848,179 @@ test("no command is sent when a transaction fails", async () => {
   }));
   assert.equal(steps.length, 0);
 });
+
+// --- The 鲸舰 synchronization after payment, and the invoice request token (round 4) ---
+
+const snapshotOfValue = (value) => ({
+  exists: value !== undefined,
+  data: () => (value === undefined ? undefined : structuredClone(value)),
+});
+
+/**
+ * Firestore runs onOrderLocalPaid after every order write; the fake store does
+ * not. Run it for what `write` changes, as Firestore would after its last write.
+ */
+async function written(write) {
+  const before = structuredClone(store.get(orderPath()));
+  await write();
+  await onOrderLocalPaid.run({ data: { before: snapshotOfValue(before), after: snapshotOfValue(order()) }, params: { orderId } });
+}
+
+const refused = (code, msg) => () => ({ json: { success: false, code, msg, data: null } });
+const unreachable = () => { throw new TypeError("fetch failed"); };
+const plainCash = () => {
+  // The cash checkout without a voucher writes twice: the payment, then LOCAL_PAID.
+  allowTwoWritesPerCommand = true;
+  return written(() => cash());
+};
+const syncedOrder = () => {
+  const { status, syncStatus, paymentStatus, hkOrderNumber, version, sync } = order();
+  return { status, syncStatus, paymentStatus, hkOrderNumber, version, sync };
+};
+
+scenario("cash, then synchronized to 鲸舰", async () => {
+  await plainCash();
+  assert.deepEqual(hk.calls.map((call) => call.action), ["order_create", "order_pay", "order_pay_query"]);
+  // Without a voucher, 鲸舰 settles the full order with its own payment method.
+  assert.deepEqual(hk.calls[1].body, { OrderNumber: "O-FAKE-0001", PayAmount: null });
+  assert.deepEqual(syncedOrder(), {
+    status: "SYNC_SUCCESS",
+    syncStatus: "SYNC_SUCCESS",
+    paymentStatus: "PAID",
+    hkOrderNumber: "O-FAKE-0001",
+    version: 3,
+    sync: { retryCount: 0, lastError: null, syncedAt: order().updatedAt },
+  });
+}, ["checkout", "sync-claim", "sync-remote-order", "sync-finish"]);
+
+scenario("a QR paid by webhook, then synchronized", async () => {
+  await create();
+  tick(MINUTE);
+  await written(() => webhook(currentCode()));
+  assert.equal(order().status, "SYNC_SUCCESS");
+}, ["qr-stage", "payos-reserve", "payos-link", "payos-paid", "sync-claim", "sync-remote-order", "sync-finish"]);
+
+scenario("a cash voucher order is paid at 鲸舰 for its discounted total", async () => {
+  await written(() => cash({ items: [{ goodsId: "vé", quantity: 2 }], voucherCodes: ["FREE-0001"] }));
+  assert.deepEqual(hk.calls[1].body, { OrderNumber: "O-FAKE-0001", PayAmount: order().totalAmount });
+  assert.equal(order().status, "SYNC_SUCCESS");
+}, ["checkout", "sync-claim", "sync-remote-order", "sync-finish"]);
+
+scenario("鲸舰 refuses the order, the schedule queues it again and it goes through", async () => {
+  hk.script.order_create = [refused(1001, "Goods not found")];
+  await plainCash();
+  assert.deepEqual(syncedOrder(), {
+    status: "SYNC_FAILED",
+    syncStatus: "SYNC_FAILED",
+    paymentStatus: "PAID",
+    hkOrderNumber: null,
+    version: 2,
+    sync: { retryCount: 1, lastError: "order_create thất bại: [1001] Goods not found", syncedAt: null },
+  });
+  tick(5 * MINUTE);
+  await written(() => retryFailedOrderSyncs.run({}));
+  // The schedule keeps the count of failed tries; the success keeps it too.
+  assert.deepEqual(order().sync, { retryCount: 1, lastError: null, syncedAt: order().updatedAt });
+  assert.equal(order().status, "SYNC_SUCCESS");
+}, ["checkout", "sync-claim", "sync-finish", "sync-requeue", "sync-claim", "sync-remote-order", "sync-finish"]);
+
+scenario("鲸舰 cannot be reached when the order is created", async () => {
+  hk.script.order_create = [() => ({ status: 502, statusText: "Bad Gateway" })];
+  await plainCash();
+  assert.equal(order().sync.lastError, "HK API HTTP error: 502 Bad Gateway");
+}, ["checkout", "sync-claim", "sync-finish"]);
+
+scenario("鲸舰 answers order_create without an order number", async () => {
+  hk.script.order_create = [() => ({ json: { success: true, code: 0, msg: "", data: {} } })];
+  await plainCash();
+  assert.equal(order().sync.lastError, "order_create không trả về orderNumber.");
+}, ["checkout", "sync-claim", "sync-finish"]);
+
+scenario("the payment fails at 鲸舰, a cashier retries it by hand", async () => {
+  hk.script.order_pay = [refused(2001, "Pay failed")];
+  await plainCash();
+  assert.equal(order().hkOrderNumber, "O-FAKE-0001");
+  assert.equal(order().sync.lastError, "order_pay thất bại: [2001] Pay failed");
+  tick(MINUTE);
+  await written(() => retryPosOrderSyncForUser(USER, reference()));
+  // The order already exists at 鲸舰: the retry checks its payment first, then pays it.
+  assert.deepEqual(hk.calls.slice(3).map((call) => call.action), ["order_pay_query", "order_pay", "order_pay_query"]);
+  assert.deepEqual(order().sync, { retryCount: 0, lastError: null, syncedAt: order().updatedAt });
+}, ["checkout", "sync-claim", "sync-remote-order", "sync-finish", "sync-retry", "sync-claim", "sync-finish"]);
+
+scenario("the answer to order_pay is lost, the retry finds the order paid", async () => {
+  hk.script.order_pay = [(body) => {
+    hk.orders.get(body.OrderNumber).paid = true;
+    throw new TypeError("fetch failed");
+  }];
+  await plainCash();
+  assert.equal(order().sync.lastError, "fetch failed");
+  tick(5 * MINUTE);
+  await written(() => retryFailedOrderSyncs.run({}));
+  assert.deepEqual(hk.calls.slice(2).map((call) => call.action), ["order_pay_query"]);
+  assert.equal(order().status, "SYNC_SUCCESS");
+}, ["checkout", "sync-claim", "sync-remote-order", "sync-finish", "sync-requeue", "sync-claim", "sync-finish"]);
+
+scenario("鲸舰 reports the payment although order_pay failed", async () => {
+  hk.script.order_pay = [(body) => {
+    hk.orders.get(body.OrderNumber).paid = true;
+    return { json: { success: false, code: 3001, msg: "Already paid", data: null } };
+  }];
+  hk.script.order_pay_query = [(body) => ({
+    json: { success: true, code: 0, msg: "", data: { orderNumber: body.OrderNumber, payStatus: "2" } },
+  })];
+  await plainCash();
+  assert.equal(order().status, "SYNC_SUCCESS");
+}, ["checkout", "sync-claim", "sync-remote-order", "sync-finish"]);
+
+scenario("鲸舰 accepts the payment but does not report it paid", async () => {
+  hk.script.order_pay_query = [(body) => ({
+    json: { success: true, code: 0, msg: "Processing", data: { orderNumber: body.OrderNumber, payStatus: 1 } },
+  })];
+  await plainCash();
+  assert.equal(order().sync.lastError, "order_pay_query chưa xác nhận đã thanh toán: Processing");
+}, ["checkout", "sync-claim", "sync-remote-order", "sync-finish"]);
+
+scenario("鲸舰 cannot be reached when the payment is checked", async () => {
+  hk.script.order_pay_query = [unreachable];
+  await plainCash();
+  assert.equal(order().sync.lastError, "fetch failed");
+  assert.equal(order().hkOrderNumber, "O-FAKE-0001");
+}, ["checkout", "sync-claim", "sync-remote-order", "sync-finish"]);
+
+scenario("a second delivery of the trigger writes nothing", async () => {
+  allowTwoWritesPerCommand = true;
+  const before = structuredClone(store.get(orderPath()));
+  await cash();
+  const paid = order();
+  const event = { data: { before: snapshotOfValue(before), after: snapshotOfValue(paid) }, params: { orderId } };
+  await onOrderLocalPaid.run(event);
+  await onOrderLocalPaid.run(event);
+  assert.equal(hk.calls.length, 3);
+}, ["checkout", "sync-claim", "sync-remote-order", "sync-finish"]);
+
+scenario("after five failed tries only a cashier can queue the order again", async () => {
+  hk.script.order_create = [unreachable];
+  await plainCash();
+  store.set(orderPath(), { ...order(), sync: { ...order().sync, retryCount: 5 } });
+  restartRecording();
+  tick(5 * MINUTE);
+  await retryFailedOrderSyncs.run({});
+  assert.equal(order().status, "SYNC_FAILED");
+  await written(() => retryPosOrderSyncForUser(USER, reference()));
+  assert.equal(order().status, "SYNC_SUCCESS");
+}, ["sync-retry", "sync-claim", "sync-remote-order", "sync-finish"]);
+
+scenario("an old order gets its invoice request token when its receipt is opened", async () => {
+  await plainCash();
+  const legacy = order();
+  delete legacy.invoiceRequestToken;
+  delete legacy.invoiceRequestCreatedAt;
+  store.set(orderPath(), legacy);
+  restartRecording();
+  tick(MINUTE);
+  await getPosOrderForUser(USER, reference());
+  // Opening it again finds the token and writes nothing.
+  await getPosOrderForUser(USER, reference());
+  assert.match(order().invoiceRequestToken, /^[A-Za-z0-9_-]{43}$/);
+}, ["invoice-token"]);

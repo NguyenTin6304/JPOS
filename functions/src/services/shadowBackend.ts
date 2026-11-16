@@ -53,7 +53,7 @@ export const SHADOW_QUEUE_REGION = "asia-southeast1";
 export const SHADOW_QUEUE_MAX_ATTEMPTS = 15;
 /** How long Cloud Tasks waits for the worker, longer than SHADOW_QUEUE_TIMEOUT_MS. */
 export const SHADOW_DISPATCH_DEADLINE_SECONDS = 30;
-const SHADOW_PATHS = new Set(["prepare", "checkout", "payment"]);
+const SHADOW_PATHS = new Set(["prepare", "checkout", "payment", "sync"]);
 
 /** One command on the Cloud Tasks queue. */
 export interface ShadowTask {
@@ -84,6 +84,77 @@ export type ShadowPaymentOperation =
   | "fixed-activate"
   | "fixed-confirm"
   | "fixed-cancel";
+
+/**
+ * One write of the 鲸舰 (Jingjianx) synchronization after payment, or of the
+ * invoice request token, posted to /shadow/pos-orders/sync.
+ */
+export type ShadowSyncOperation =
+  | "sync-claim"
+  | "sync-remote-order"
+  | "sync-finish"
+  | "sync-retry"
+  | "sync-requeue"
+  | "invoice-token";
+
+const SHADOW_SYNC_OPERATIONS: ReadonlySet<string> = new Set<ShadowSyncOperation>([
+  "sync-claim",
+  "sync-remote-order",
+  "sync-finish",
+  "sync-retry",
+  "sync-requeue",
+  "invoice-token",
+]);
+
+export function isShadowSyncOperation(operation: string): operation is ShadowSyncOperation {
+  return SHADOW_SYNC_OPERATIONS.has(operation);
+}
+
+/** A 鲸舰 call the order synchronization makes. */
+export type ShadowRemoteAction = "order_create" | "order_pay" | "order_pay_query";
+
+/**
+ * What one 鲸舰 call answered, as far as the synchronization uses it: the
+ * response fields its decisions and error messages read, or the message of the
+ * error the call threw. The backend replays the synchronization on these.
+ */
+export interface ShadowRemoteCall {
+  action: ShadowRemoteAction;
+  success?: unknown;
+  code?: unknown;
+  msg?: unknown;
+  /** order_create: data.orderNumber. */
+  orderNumber?: unknown;
+  /** order_pay_query: data.payStatus. */
+  payStatus?: unknown;
+  /** The call threw: the message the synchronization records as its error. */
+  error?: string;
+}
+
+/** The response fields of one 鲸舰 call the synchronization reads. Undefined fields are left out. */
+export function shadowRemoteResponse(
+  action: ShadowRemoteAction,
+  response: { success?: unknown; code?: unknown; msg?: unknown; data?: unknown },
+): ShadowRemoteCall {
+  const data = response.data && typeof response.data === "object"
+    ? response.data as Record<string, unknown>
+    : {};
+  const field = action === "order_create" ? "orderNumber" : action === "order_pay_query" ? "payStatus" : null;
+  return Object.fromEntries(
+    Object.entries({
+      action,
+      success: response.success,
+      code: response.code,
+      msg: response.msg,
+      ...(field ? { [field]: data[field] } : {}),
+    }).filter(([, value]) => value !== undefined),
+  ) as unknown as ShadowRemoteCall;
+}
+
+/** A 鲸舰 call that threw, with the message the synchronization records. */
+export function shadowRemoteError(action: ShadowRemoteAction, error: unknown): ShadowRemoteCall {
+  return { action, error: error instanceof Error ? error.message : String(error) };
+}
 
 export type ShadowOrderRef = Pick<PosOrder, "localOrderId" | "warehouseId">;
 
@@ -232,6 +303,25 @@ export async function sendShadowPayment(
     localOrderId: order.localOrderId,
     warehouseId: order.warehouseId,
     ...(previousUpdatedAt !== undefined ? { previousUpdatedAt } : {}),
+  });
+}
+
+/**
+ * Send one write of the 鲸舰 synchronization, or of the invoice request token,
+ * after Firestore has committed it. `before` is the order as the write read it,
+ * before writing: its updatedAt orders the command. Never throws.
+ */
+export async function sendShadowSync(
+  operation: ShadowSyncOperation,
+  before: ShadowOrderBefore,
+  values: Record<string, unknown>,
+): Promise<void> {
+  await postCommand("sync", operation, {
+    ...values,
+    operation,
+    localOrderId: before.localOrderId,
+    warehouseId: before.warehouseId,
+    previousUpdatedAt: before.updatedAt ?? null,
   });
 }
 
