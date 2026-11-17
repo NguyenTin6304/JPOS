@@ -24,6 +24,14 @@ import {
 } from "./packagePolicy";
 import { getLuckyDrawSettingsForWarehouse } from "../luckyDraw/luckyDrawSettingsFunctions";
 import { resolveLuckyDrawTicketCount } from "../luckyDraw/luckyDrawSettingsPolicy";
+import {
+  sendShadowPackage,
+  shadowRemoteError,
+  shadowRemoteResponse,
+  type ShadowRemoteAction,
+  type ShadowRemoteCall,
+} from "../services/shadowBackend";
+import { runShadowedTransaction } from "../services/shadowTransaction";
 
 interface OperatorInfo {
   employeeId: string;
@@ -154,7 +162,25 @@ export async function prepareMemberPackageOrderForUser(
     selectedPackage.goodsId,
     selectedPackage.category,
   );
-  const order = await db.runTransaction(async (transaction) => {
+  // The shadow command of this write: the input, the package as 鲸舰 returned it
+  // and the lucky-draw count as looked up; the backend prices the line itself.
+  const shadowValues = (updatedAt: string) => ({
+    shopId: input.shopId,
+    uid: input.uid,
+    member: input.member,
+    goodsId: input.goodsId,
+    operator,
+    package: {
+      goodsId: selectedPackage.goodsId,
+      name: selectedPackage.name,
+      paymentAmountVnd: selectedPackage.paymentAmountVnd,
+      taxRate: selectedPackage.taxRate,
+      taxRateType: selectedPackage.taxRateType,
+    },
+    luckyDrawTicketsPerUnit,
+    updatedAt,
+  });
+  const order = await runShadowedTransaction("package-prepare", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     if (snapshot.exists) {
       const existing = snapshot.data() as PosOrder;
@@ -175,6 +201,7 @@ export async function prepareMemberPackageOrderForUser(
           items,
           updatedAt,
         });
+        recordShadow(existing, shadowValues(updatedAt));
         return { ...existing, member: input.member, items, updatedAt };
       }
       return existing;
@@ -186,6 +213,10 @@ export async function prepareMemberPackageOrderForUser(
       luckyDrawTicketsPerUnit,
     );
     transaction.create(docRef, draft);
+    recordShadow(
+      { localOrderId: input.localOrderId, warehouseId: input.warehouseId },
+      shadowValues(draft.updatedAt),
+    );
     return draft;
   });
 
@@ -222,7 +253,7 @@ async function markSyncFailed(
   order: PosOrder,
   reason: string,
   hkOrderNumber: string | null,
-): Promise<void> {
+): Promise<string> {
   const updatedAt = new Date().toISOString();
   await docRef.update({
     status: "SYNC_FAILED",
@@ -234,6 +265,7 @@ async function markSyncFailed(
       syncedAt: null,
     },
   });
+  return updatedAt;
 }
 
 async function finalizeMemberPackageOrder(
@@ -279,20 +311,50 @@ async function finalizeMemberPackageOrder(
     );
   }
 
-  await docRef.update({ status: "SYNCING", updatedAt: new Date().toISOString() });
+  // Shadow commands of the writes below, each ordered by the updatedAt of the
+  // write before it. `remoteCalls` is what each 鲸舰 call of this run answered:
+  // the backend replays the decisions on it.
+  let lastUpdatedAt: string | null | undefined = order.updatedAt;
+  const sendShadow = async (
+    operation: "package-sync-start" | "package-remote-order" | "package-sync-finish",
+    updatedAt: string,
+    values: Record<string, unknown> = {},
+  ): Promise<void> => {
+    const before = { localOrderId, warehouseId: order.warehouseId, updatedAt: lastUpdatedAt };
+    lastUpdatedAt = updatedAt;
+    await sendShadowPackage(operation, before, { ...values, updatedAt });
+  };
+  const remoteCalls: ShadowRemoteCall[] = [];
+  const recorded = async <T>(
+    action: ShadowRemoteAction,
+    pending: Promise<HKApiResponse<T>>,
+  ): Promise<HKApiResponse<T>> => {
+    try {
+      const response = await pending;
+      remoteCalls.push(shadowRemoteResponse(action, response, true));
+      return response;
+    } catch (error: unknown) {
+      remoteCalls.push(shadowRemoteError(action, error, "Không rõ nguyên nhân"));
+      throw error;
+    }
+  };
+
+  const startedAt = new Date().toISOString();
+  await docRef.update({ status: "SYNCING", updatedAt: startedAt });
+  await sendShadow("package-sync-start", startedAt);
   let hkOrderNumber = order.hkOrderNumber;
   let currentAction = "order_create";
   try {
     if (!hkOrderNumber) {
       const createResponse = await callRemote(
         "order_create",
-        () => createRemoteOrder({
+        () => recorded("order_create", createRemoteOrder({
           uid: order.uid!,
           goodsItems: order.items.map((item) => ({
             goodsId: item.goodsId,
             quantity: String(item.quantity),
           })),
-        }),
+        })),
       );
       hkOrderNumber = typeof createResponse.data?.orderNumber === "string"
         ? createResponse.data.orderNumber
@@ -305,13 +367,15 @@ async function finalizeMemberPackageOrder(
         );
       }
       const remoteActualPayment = Number(createResponse.data?.actualPayment);
+      const numberedAt = new Date().toISOString();
       await docRef.update({
         hkOrderNumber,
         remoteActualPayment: Number.isFinite(remoteActualPayment)
           ? remoteActualPayment
           : null,
-        updatedAt: new Date().toISOString(),
+        updatedAt: numberedAt,
       });
+      await sendShadow("package-remote-order", numberedAt, { remote: [...remoteCalls] });
       if (
         !Number.isFinite(remoteActualPayment) ||
         remoteActualPayment !== order.totalAmount
@@ -339,18 +403,18 @@ async function finalizeMemberPackageOrder(
     currentAction = "order_pay_query";
     let statusResponse = await callRemote(
       "order_pay_query",
-      () => queryPaymentStatus({ orderNumber: hkOrderNumber! }),
+      () => recorded("order_pay_query", queryPaymentStatus({ orderNumber: hkOrderNumber! })),
     );
     if (!isPaid(statusResponse)) {
       currentAction = "order_pay";
       const payResponse = await callRemote(
         "order_pay",
-        () => confirmRemotePayment({ orderNumber: hkOrderNumber! }),
+        () => recorded("order_pay", confirmRemotePayment({ orderNumber: hkOrderNumber! })),
       );
       currentAction = "order_pay_query";
       statusResponse = await callRemote(
         "order_pay_query",
-        () => queryPaymentStatus({ orderNumber: hkOrderNumber! }),
+        () => recorded("order_pay_query", queryPaymentStatus({ orderNumber: hkOrderNumber! })),
       );
       if (!payResponse.success && !isPaid(statusResponse)) {
         throw new MemberRemoteApiError(
@@ -381,6 +445,7 @@ async function finalizeMemberPackageOrder(
         syncedAt: completedAt,
       },
     });
+    await sendShadow("package-sync-finish", completedAt, { remote: [...remoteCalls] });
     return {
       localOrderId,
       remoteOrderNumber: hkOrderNumber,
@@ -389,7 +454,8 @@ async function finalizeMemberPackageOrder(
     };
   } catch (error: unknown) {
     const reason = error instanceof Error ? error.message : "OpenAPI xử lý thất bại.";
-    await markSyncFailed(docRef, order, reason, hkOrderNumber);
+    const failedAt = await markSyncFailed(docRef, order, reason, hkOrderNumber);
+    await sendShadow("package-sync-finish", failedAt, { remote: [...remoteCalls] });
     if (error instanceof MemberRemoteApiError) throw error;
     throw new MemberRemoteApiError(currentAction, null, reason);
   }
@@ -402,7 +468,7 @@ export async function sellMemberPackageForCashForUser(
   const input = validateMemberPackageSaleInput(data);
   await prepareMemberPackageOrderForUser(userId, input);
   const docRef = db.collection(POS_COLLECTIONS.orders).doc(input.localOrderId);
-  await db.runTransaction(async (transaction) => {
+  await runShadowedTransaction("package-cash", async (transaction, recordShadow) => {
     const snapshot = await transaction.get(docRef);
     const order = snapshot.data() as PosOrder;
     if (order.status !== "DRAFT") return;
@@ -415,6 +481,7 @@ export async function sellMemberPackageForCashForUser(
       paidAt,
       updatedAt: paidAt,
     });
+    recordShadow(order, { updatedAt: paidAt });
   });
   return finalizeMemberPackageOrder(userId, input.localOrderId);
 }

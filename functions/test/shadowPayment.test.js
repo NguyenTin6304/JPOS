@@ -36,6 +36,13 @@ const {
   retryPosOrderSyncForUser,
 } = require("../lib/order/functions");
 const { runShadowedTransaction } = require("../lib/services/shadowTransaction");
+const memberPackageService = require("../lib/services/memberPackageService");
+const { MemberRemoteApiError } = require("../lib/member/functions");
+const {
+  finalizeMemberPackageSaleForUser,
+  prepareMemberPackageOrderForUser,
+  sellMemberPackageForCashForUser,
+} = require("../lib/member/packageFunctions");
 
 const USER = "cashier-1";
 const OPERATOR_NAME = "Thu ngân giả";
@@ -440,7 +447,8 @@ function hkDefault(action, body) {
     hk.created += 1;
     const orderNumber = `O-FAKE-${String(hk.created).padStart(4, "0")}`;
     hk.orders.set(orderNumber, { paid: false });
-    return { json: { success: true, code: 0, msg: "", data: { orderNumber, totalAmount: 0, discountAmount: 0, actualPayment: 0 } } };
+    const actualPayment = hk.actualPayment ?? 0;
+    return { json: { success: true, code: 0, msg: "", data: { orderNumber, totalAmount: actualPayment, discountAmount: 0, actualPayment } } };
   }
   if (action === "order_pay") {
     const remote = hk.orders.get(body.OrderNumber);
@@ -476,6 +484,7 @@ async function hkFetch(init) {
 const savedFetch = global.fetch;
 const savedSession = auth.getPosAuthSession;
 const savedGetPayOS = payosService.getPayOS;
+const savedLoadPackage = memberPackageService.loadRemoteMemberPackage;
 const savedDb = { collection: db.collection, runTransaction: db.runTransaction, getAll: db.getAll };
 
 test.before(() => {
@@ -502,6 +511,12 @@ test.before(() => {
     permissions: { global: { "*": true } },
   });
   payosService.getPayOS = fakePayOS;
+  // The member packages 鲸舰 sells, as loadRemoteMemberPackage maps them.
+  memberPackageService.loadRemoteMemberPackage = async (uid, goodsId) => {
+    const selected = MEMBER_PACKAGES[goodsId];
+    if (!selected) throw new MemberRemoteApiError("setmeal_getsellgoods", null, "Gói thành viên không còn mở bán.");
+    return structuredClone(selected);
+  };
   process.env.HK_API_BASE_URL = HK_BASE_URL;
   process.env.HK_API_APP_ID = "app-fake";
   process.env.HK_API_KEY = "key-fake";
@@ -525,6 +540,7 @@ test.after(() => {
   global.fetch = savedFetch;
   auth.getPosAuthSession = savedSession;
   payosService.getPayOS = savedGetPayOS;
+  memberPackageService.loadRemoteMemberPackage = savedLoadPackage;
   Object.assign(db, savedDb);
   delete process.env.SHADOW_BACKEND_URL;
   delete process.env.SHADOW_STORE_TOKENS;
@@ -1024,3 +1040,178 @@ scenario("an old order gets its invoice request token when its receipt is opened
   await getPosOrderForUser(USER, reference());
   assert.match(order().invoiceRequestToken, /^[A-Za-z0-9_-]{43}$/);
 }, ["invoice-token"]);
+
+// --- Member package sales: one package line, priced by 鲸舰, credited there right after payment ---
+
+const PACKAGE_MEMBER = { uid: "m1", memberCode: "MC-1", fullName: "Khách giả", phone: "0900000000", levelName: "Bạc" };
+const MEMBER_PACKAGES = {
+  // 100000 including 8% tax.
+  "pkg-percent": {
+    goodsId: "pkg-percent", name: "Gói 100 điểm giả", paymentAmountVnd: 100000, taxRate: 8, taxRateType: 1, category: 1,
+  },
+  // 640000 including a fixed tax of 5000.
+  "pkg-fixed": {
+    goodsId: "pkg-fixed", name: "Gói thuế cố định giả", paymentAmountVnd: 640000, taxRate: 5000, taxRateType: 2, category: 2,
+  },
+  // 100000 with a fixed tax above the price: the whole price is tax.
+  "pkg-all-tax": {
+    goodsId: "pkg-all-tax", name: "Gói thuế toàn phần giả", paymentAmountVnd: 100000, taxRate: 150000, taxRateType: 2, category: 1,
+  },
+};
+const packageInput = (goodsId = "pkg-percent") => ({
+  localOrderId: orderId,
+  shopId: SHOP,
+  warehouseId: WAREHOUSE,
+  uid: PACKAGE_MEMBER.uid,
+  goodsId,
+  member: PACKAGE_MEMBER,
+});
+/** Sell for cash; 鲸舰 prices its order at `remoteAmount` (by default the package price). */
+const sellPackageForCash = (goodsId = "pkg-percent", remoteAmount = MEMBER_PACKAGES[goodsId].paymentAmountVnd) => {
+  hk.actualPayment = remoteAmount;
+  return sellMemberPackageForCashForUser(USER, packageInput(goodsId));
+};
+const finalizePackage = () => finalizeMemberPackageSaleForUser(USER, reference());
+const stillUnpaid = (description) => (body) => ({
+  json: {
+    success: true,
+    code: 0,
+    msg: "",
+    data: { orderNumber: body.OrderNumber, payStatus: 1, payStatusDesc: description },
+  },
+});
+const PACKAGE_SYNC = ["package-sync-start", "package-remote-order", "package-sync-finish"];
+
+scenario("a member package paid in cash and credited at 鲸舰", async () => {
+  const result = await sellPackageForCash();
+  assert.equal(result.status, "SYNC_SUCCESS");
+  // A new 鲸舰 order is checked first, then paid, then checked again.
+  assert.deepEqual(hk.calls.map((call) => call.action), ["order_create", "order_pay_query", "order_pay", "order_pay_query"]);
+  assert.deepEqual(order().items, [{
+    goodsId: "pkg-percent",
+    goodsName: "Gói 100 điểm giả",
+    price: 100000,
+    quantity: 1,
+    unitPriceBeforeTax: 92593,
+    taxRate: 8,
+    taxAmount: 7407,
+    luckyDrawTicketsPerUnit: 0,
+  }]);
+  assert.equal(order().remoteActualPayment, 100000);
+}, ["package-prepare", "package-cash", ...PACKAGE_SYNC]);
+
+scenario("a package with a fixed tax and lucky-draw tickets, prepared before it is paid", async () => {
+  store.set(`pos_lucky_draw_settings/${WAREHOUSE}`, { enabled: true, packageTicketCounts: { "pkg-fixed": 3 } });
+  await prepareMemberPackageOrderForUser(USER, packageInput("pkg-fixed"));
+  tick(MINUTE);
+  // Preparing it again changes nothing.
+  await prepareMemberPackageOrderForUser(USER, packageInput("pkg-fixed"));
+  tick(MINUTE);
+  await sellPackageForCash("pkg-fixed");
+  const [line] = order().items;
+  assert.deepEqual(
+    [line.unitPriceBeforeTax, line.taxRate, line.taxAmount, line.luckyDrawTicketsPerUnit],
+    [635000, 0.7874, 5000, 3],
+  );
+}, ["package-prepare", "package-cash", ...PACKAGE_SYNC]);
+
+scenario("an old package draft gets its lucky-draw count when it is prepared again", async () => {
+  await prepareMemberPackageOrderForUser(USER, packageInput());
+  const old = order();
+  delete old.items[0].luckyDrawTicketsPerUnit;
+  store.set(orderPath(), old);
+  restartRecording();
+  tick(MINUTE);
+  await prepareMemberPackageOrderForUser(USER, packageInput());
+  assert.equal(order().items[0].luckyDrawTicketsPerUnit, 0);
+}, ["package-prepare"]);
+
+scenario("鲸舰 refuses the package order", async () => {
+  hk.script.order_create = [refused(404, "Order creation failed")];
+  await assert.rejects(sellPackageForCash(), MemberRemoteApiError);
+  assert.deepEqual(syncedOrder().sync, { retryCount: 1, lastError: "Order creation failed", syncedAt: null });
+  assert.equal(order().hkOrderNumber, null);
+}, ["package-prepare", "package-cash", "package-sync-start", "package-sync-finish"]);
+
+scenario("鲸舰 prices the package differently: the sync stops, and so does every retry", async () => {
+  await assert.rejects(sellPackageForCash("pkg-percent", 90000), MemberRemoteApiError);
+  // The 鲸舰 order number and its amount are kept for reconciliation; nothing was paid there.
+  assert.equal(order().hkOrderNumber, "O-FAKE-0001");
+  assert.equal(order().remoteActualPayment, 90000);
+  assert.deepEqual(hk.calls.map((call) => call.action), ["order_create"]);
+  tick(MINUTE);
+  await assert.rejects(finalizePackage(), MemberRemoteApiError);
+  assert.equal(hk.calls.length, 1);
+  assert.equal(order().sync.retryCount, 2);
+}, [
+  "package-prepare", "package-cash", ...PACKAGE_SYNC,
+  "package-sync-start", "package-sync-finish",
+]);
+
+scenario("鲸舰 cannot be reached, the cashier finalizes the package again", async () => {
+  hk.script.order_create = [unreachable];
+  await assert.rejects(sellPackageForCash(), MemberRemoteApiError);
+  assert.equal(order().sync.lastError, "Không thể kết nối OpenAPI: fetch failed");
+  tick(MINUTE);
+  assert.equal((await finalizePackage()).status, "SYNC_SUCCESS");
+  assert.deepEqual(order().sync, { retryCount: 1, lastError: null, syncedAt: order().updatedAt });
+}, [
+  "package-prepare", "package-cash", "package-sync-start", "package-sync-finish",
+  ...PACKAGE_SYNC,
+]);
+
+scenario("the package payment fails at 鲸舰, then is accepted but not reported paid, then goes through", async () => {
+  hk.script.order_pay = [refused(2001, "Pay failed")];
+  await assert.rejects(sellPackageForCash(), MemberRemoteApiError);
+  assert.equal(order().sync.lastError, "Pay failed");
+  tick(MINUTE);
+  hk.script.order_pay_query = [stillUnpaid("paying"), stillUnpaid("paying")];
+  await assert.rejects(finalizePackage(), MemberRemoteApiError);
+  // The status text of 鲸舰 is the error.
+  assert.equal(order().sync.lastError, "paying");
+  tick(MINUTE);
+  assert.equal((await finalizePackage()).status, "SYNC_SUCCESS");
+  assert.equal(order().sync.retryCount, 2);
+}, [
+  "package-prepare", "package-cash", ...PACKAGE_SYNC,
+  "package-sync-start", "package-sync-finish",
+  "package-sync-start", "package-sync-finish",
+]);
+
+scenario("a member package paid by QR, then finalized by the cashier", async () => {
+  await prepareMemberPackageOrderForUser(USER, packageInput());
+  tick(MINUTE);
+  await create({ items: [{ goodsId: "pkg-percent", quantity: 1 }], uid: PACKAGE_MEMBER.uid, member: PACKAGE_MEMBER });
+  assert.equal(order().paymentMethodId, "QR_CODE");
+  tick(MINUTE);
+  await webhook(currentCode());
+  assert.equal(order().status, "LOCAL_PAID");
+  tick(MINUTE);
+  hk.actualPayment = 100000;
+  assert.equal((await finalizePackage()).status, "SYNC_SUCCESS");
+}, ["package-prepare", "package-qr-stage", "payos-reserve", "payos-link", "payos-paid", ...PACKAGE_SYNC]);
+
+scenario("a package QR cancelled at the POS, then paid in cash", async () => {
+  await prepareMemberPackageOrderForUser(USER, packageInput());
+  tick(MINUTE);
+  await create({ items: [{ goodsId: "pkg-percent", quantity: 1 }], uid: PACKAGE_MEMBER.uid, member: PACKAGE_MEMBER });
+  tick(MINUTE);
+  await cancelPayOSPaymentForUser(USER, reference());
+  tick(MINUTE);
+  assert.equal((await sellPackageForCash()).status, "SYNC_SUCCESS");
+  assert.equal(order().paymentMethodId, "CASH");
+}, [
+  "package-prepare", "package-qr-stage", "payos-reserve", "payos-link", "payos-status",
+  "package-cash", ...PACKAGE_SYNC,
+]);
+
+scenario("a package whose fixed tax covers the whole price, then its receipt gets an invoice request token", async () => {
+  await sellPackageForCash("pkg-all-tax");
+  const [line] = order().items;
+  // The whole price is tax, and JPOS then writes the tax amount as the rate.
+  assert.deepEqual([line.unitPriceBeforeTax, line.taxRate, line.taxAmount], [0, 150000, 100000]);
+  assert.equal(order().invoiceRequestToken, undefined);
+  tick(MINUTE);
+  await getPosOrderForUser(USER, reference());
+  assert.match(order().invoiceRequestToken, /^[A-Za-z0-9_-]{43}$/);
+}, ["package-prepare", "package-cash", ...PACKAGE_SYNC, "invoice-token"]);

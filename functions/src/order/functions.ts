@@ -472,7 +472,7 @@ export async function stagePosOrderForPayOS(
     const existing = existingSnapshot.data() as PosOrder;
     if (existing.orderKind === "MEMBER_PACKAGE") {
       await assertWarehouseAccess(userId, input.warehouseId);
-      return db.runTransaction(async (transaction) => {
+      return runShadowedTransaction("package-qr-stage", async (transaction, recordShadow) => {
         const freshSnapshot = await transaction.get(docRef);
         if (!freshSnapshot.exists) throw new HttpsError("not-found", "Không tìm thấy đơn bán gói.");
         const existing = freshSnapshot.data() as PosOrder;
@@ -503,6 +503,14 @@ export async function stagePosOrderForPayOS(
           paymentMethod: "QR_CODE",
           paymentMethodId: "QR_CODE",
           paymentMethodName: "Chuyển khoản",
+          updatedAt,
+        });
+        recordShadow(existing, {
+          operatorUid: userId,
+          shopId: input.shopId,
+          ...(input.deviceId ? { deviceId: input.deviceId } : {}),
+          goodsId: input.items[0].goodsId,
+          quantity: input.items[0].quantity,
           updatedAt,
         });
         return {

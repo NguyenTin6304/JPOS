@@ -1,10 +1,13 @@
 import type { Transaction } from "firebase-admin/firestore";
 import { db } from "../config/firebase";
 import {
+  isShadowPackageOperation,
   isShadowSyncOperation,
+  sendShadowPackage,
   sendShadowPayment,
   sendShadowSync,
   type ShadowOrderBefore,
+  type ShadowPackageOperation,
   type ShadowPaymentOperation,
   type ShadowSyncOperation,
 } from "./shadowBackend";
@@ -26,12 +29,13 @@ interface PendingShadow {
 
 /**
  * db.runTransaction for an order write that has a parallel-run shadow command:
- * a write of the QR payment flow, or of the 鲸舰 synchronization. Call
- * recordShadow where the transaction writes the order; the command is sent only
- * after the commit, and never when the transaction wrote nothing.
+ * a write of the QR payment flow, of the 鲸舰 synchronization, or of a member
+ * package sale. Call recordShadow where the transaction writes the order; the
+ * command is sent only after the commit, and never when the transaction wrote
+ * nothing.
  */
 export async function runShadowedTransaction<T>(
-  operation: ShadowPaymentOperation | ShadowSyncOperation,
+  operation: ShadowPaymentOperation | ShadowSyncOperation | ShadowPackageOperation,
   body: (transaction: Transaction, recordShadow: RecordShadow) => Promise<T>,
 ): Promise<T> {
   const pending: { write: PendingShadow | null } = { write: null };
@@ -46,6 +50,8 @@ export async function runShadowedTransaction<T>(
     const { before, values } = pending.write;
     if (isShadowSyncOperation(operation)) {
       await sendShadowSync(operation, before, values);
+    } else if (isShadowPackageOperation(operation)) {
+      await sendShadowPackage(operation, before, values);
     } else {
       await sendShadowPayment(operation, before, values, before.updatedAt ?? null);
     }

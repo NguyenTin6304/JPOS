@@ -53,7 +53,7 @@ export const SHADOW_QUEUE_REGION = "asia-southeast1";
 export const SHADOW_QUEUE_MAX_ATTEMPTS = 15;
 /** How long Cloud Tasks waits for the worker, longer than SHADOW_QUEUE_TIMEOUT_MS. */
 export const SHADOW_DISPATCH_DEADLINE_SECONDS = 30;
-const SHADOW_PATHS = new Set(["prepare", "checkout", "payment", "sync"]);
+const SHADOW_PATHS = new Set(["prepare", "checkout", "payment", "sync", "package"]);
 
 /** One command on the Cloud Tasks queue. */
 export interface ShadowTask {
@@ -110,6 +110,28 @@ export function isShadowSyncOperation(operation: string): operation is ShadowSyn
   return SHADOW_SYNC_OPERATIONS.has(operation);
 }
 
+/** One write of a member package sale, posted to /shadow/pos-orders/package. */
+export type ShadowPackageOperation =
+  | "package-prepare"
+  | "package-cash"
+  | "package-qr-stage"
+  | "package-sync-start"
+  | "package-remote-order"
+  | "package-sync-finish";
+
+const SHADOW_PACKAGE_OPERATIONS: ReadonlySet<string> = new Set<ShadowPackageOperation>([
+  "package-prepare",
+  "package-cash",
+  "package-qr-stage",
+  "package-sync-start",
+  "package-remote-order",
+  "package-sync-finish",
+]);
+
+export function isShadowPackageOperation(operation: string): operation is ShadowPackageOperation {
+  return SHADOW_PACKAGE_OPERATIONS.has(operation);
+}
+
 /** A 鲸舰 call the order synchronization makes. */
 export type ShadowRemoteAction = "order_create" | "order_pay" | "order_pay_query";
 
@@ -127,39 +149,63 @@ export interface ShadowRemoteCall {
   orderNumber?: unknown;
   /** order_pay_query: data.payStatus. */
   payStatus?: unknown;
+  /** order_create of a member package sale: data.actualPayment. */
+  actualPayment?: unknown;
+  /** order_pay_query of a member package sale: data.payStatusDesc. */
+  payStatusDesc?: unknown;
   /** The call threw: the message the synchronization records as its error. */
   error?: string;
 }
 
-/** The response fields of one 鲸舰 call the synchronization reads. Undefined fields are left out. */
+/**
+ * The response fields of one 鲸舰 call the synchronization reads. Undefined
+ * fields are left out. `packageSale` adds the two fields only the member
+ * package synchronization reads.
+ */
 export function shadowRemoteResponse(
   action: ShadowRemoteAction,
   response: { success?: unknown; code?: unknown; msg?: unknown; data?: unknown },
+  packageSale = false,
 ): ShadowRemoteCall {
   const data = response.data && typeof response.data === "object"
     ? response.data as Record<string, unknown>
     : {};
-  const field = action === "order_create" ? "orderNumber" : action === "order_pay_query" ? "payStatus" : null;
+  const fields = action === "order_create"
+    ? ["orderNumber", ...(packageSale ? ["actualPayment"] : [])]
+    : action === "order_pay_query"
+      ? ["payStatus", ...(packageSale ? ["payStatusDesc"] : [])]
+      : [];
   return Object.fromEntries(
     Object.entries({
       action,
       success: response.success,
       code: response.code,
       msg: response.msg,
-      ...(field ? { [field]: data[field] } : {}),
+      ...Object.fromEntries(fields.map((field) => [field, data[field]])),
     }).filter(([, value]) => value !== undefined),
   ) as unknown as ShadowRemoteCall;
 }
 
-/** A 鲸舰 call that threw, with the message the synchronization records. */
-export function shadowRemoteError(action: ShadowRemoteAction, error: unknown): ShadowRemoteCall {
-  return { action, error: error instanceof Error ? error.message : String(error) };
+/**
+ * A 鲸舰 call that threw, with the message the synchronization records.
+ * `otherThrown` is what the caller records for a thrown value that is not an
+ * Error; by default its text.
+ */
+export function shadowRemoteError(
+  action: ShadowRemoteAction,
+  error: unknown,
+  otherThrown?: string,
+): ShadowRemoteCall {
+  return { action, error: error instanceof Error ? error.message : otherThrown ?? String(error) };
 }
 
 export type ShadowOrderRef = Pick<PosOrder, "localOrderId" | "warehouseId">;
 
-/** The order as a write read it, before writing: its updatedAt orders the command. */
-export type ShadowOrderBefore = Pick<PosOrder, "localOrderId" | "warehouseId" | "updatedAt">;
+/**
+ * The order as a write read it, before writing: its updatedAt orders the
+ * command. A write that creates the order has no updatedAt to give.
+ */
+export type ShadowOrderBefore = ShadowOrderRef & { updatedAt?: string | null };
 
 /** The validated order input, as produced by validateOrderInput. */
 export interface ShadowOrderInput {
@@ -316,7 +362,29 @@ export async function sendShadowSync(
   before: ShadowOrderBefore,
   values: Record<string, unknown>,
 ): Promise<void> {
-  await postCommand("sync", operation, {
+  await postOrderedCommand("sync", operation, before, values);
+}
+
+/**
+ * Send one write of a member package sale after Firestore has committed it.
+ * `before` is the order as the write read it (without updatedAt when the write
+ * created the order). Never throws.
+ */
+export async function sendShadowPackage(
+  operation: ShadowPackageOperation,
+  before: ShadowOrderBefore,
+  values: Record<string, unknown>,
+): Promise<void> {
+  await postOrderedCommand("package", operation, before, values);
+}
+
+async function postOrderedCommand(
+  path: string,
+  operation: string,
+  before: ShadowOrderBefore,
+  values: Record<string, unknown>,
+): Promise<void> {
+  await postCommand(path, operation, {
     ...values,
     operation,
     localOrderId: before.localOrderId,

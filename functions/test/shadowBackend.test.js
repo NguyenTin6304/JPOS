@@ -10,8 +10,10 @@ const {
   SHADOW_TIMEOUT_MS,
   buildShadowOrderCommand,
   handleShadowTask,
+  isShadowPackageOperation,
   isShadowSyncOperation,
   sendShadowOrder,
+  sendShadowPackage,
   sendShadowPayment,
   sendShadowSync,
   shadowAppliedVouchers,
@@ -596,5 +598,65 @@ test("the worker delivers a queued sync command", async () => {
 
     assert.equal(calls.length, 1);
     assert.equal(calls[0].target, "https://api.example.test/shadow/pos-orders/sync");
+  });
+});
+
+// --- Member package sales ---
+
+test("a package command goes to the package path; the write that creates the order has no previous version", async () => {
+  await withFakes({ respond: ok() }, async ({ calls }) => {
+    await sendShadowPackage("package-prepare", orderRef, { updatedAt: BEFORE, operation: "other", warehouseId: "w2" });
+    await sendShadowPackage(
+      "package-cash",
+      { ...orderRef, updatedAt: BEFORE },
+      { updatedAt: "2026-10-27T03:05:00.000Z" },
+    );
+
+    assert.equal(calls[0].target, "https://api.example.test/shadow/pos-orders/package");
+    assert.equal(calls[0].init.headers["X-Store-Token"], TOKEN);
+    assert.deepEqual(JSON.parse(calls[0].init.body), {
+      updatedAt: BEFORE,
+      operation: "package-prepare",
+      localOrderId: input.localOrderId,
+      warehouseId: "w1",
+      previousUpdatedAt: null,
+    });
+    assert.equal(JSON.parse(calls[1].init.body).previousUpdatedAt, BEFORE);
+  });
+  assert.equal(isShadowPackageOperation("package-sync-finish"), true);
+  assert.equal(isShadowPackageOperation("sync-finish"), false);
+  assert.equal(isShadowSyncOperation("package-sync-finish"), false);
+});
+
+test("a package sync also records the amount and the status text the remote reports", () => {
+  const created = { success: true, code: 0, msg: "", data: { orderNumber: "O-1", actualPayment: 100000 } };
+  const queried = { success: true, code: 0, msg: "", data: { payStatus: 0, payStatusDesc: "to be paid" } };
+
+  assert.deepEqual(shadowRemoteResponse("order_create", created, true), {
+    action: "order_create", success: true, code: 0, msg: "", orderNumber: "O-1", actualPayment: 100000,
+  });
+  assert.deepEqual(shadowRemoteResponse("order_pay_query", queried, true), {
+    action: "order_pay_query", success: true, code: 0, msg: "", payStatus: 0, payStatusDesc: "to be paid",
+  });
+  // The standard order sync does not read them, and does not send them.
+  assert.equal("actualPayment" in shadowRemoteResponse("order_create", created), false);
+  assert.equal("payStatusDesc" in shadowRemoteResponse("order_pay_query", queried), false);
+  // The package sync words a thrown value that is not an Error its own way.
+  assert.deepEqual(shadowRemoteError("order_pay", "boom", "Không rõ nguyên nhân"), {
+    action: "order_pay",
+    error: "Không rõ nguyên nhân",
+  });
+  assert.equal(shadowRemoteError("order_pay", new Error("fetch failed"), "Không rõ nguyên nhân").error, "fetch failed");
+});
+
+test("the worker delivers a queued package command", async () => {
+  await withFakes({ respond: ok() }, async ({ calls }) => {
+    await handleShadowTask({
+      path: "package",
+      operation: "package-cash",
+      command: { operation: "package-cash", localOrderId: input.localOrderId, warehouseId: "w1" },
+    }, 0);
+
+    assert.equal(calls[0].target, "https://api.example.test/shadow/pos-orders/package");
   });
 });
